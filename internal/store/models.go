@@ -84,6 +84,17 @@ type Cursor struct {
 	FinalizedBlock uint64
 }
 
+// DecodedRecord 是 decoded_event 一行在内存中的形态。
+//
+// Status 取 decoded 或 undecodable；未解出参数的记录同样入库，payload 为空对象。
+type DecodedRecord struct {
+	TxHash    common.Hash
+	LogIndex  uint32
+	EventName string
+	Status    string
+	Payload   map[string]any
+}
+
 // NewLogRecord 把 RPC 返回的原始日志转换为可写入 chain_log 的记录。
 //
 // topic 数量可变（0~4），超出部分置空；data 为 nil 时写入空串以满足 NOT NULL 约束。
