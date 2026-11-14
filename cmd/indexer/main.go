@@ -15,6 +15,7 @@ import (
 
 	"github.com/dyyyyy-1/chainlens/internal/chain"
 	"github.com/dyyyyy-1/chainlens/internal/config"
+	"github.com/dyyyyy-1/chainlens/internal/decoder"
 	"github.com/dyyyyy-1/chainlens/internal/indexer"
 	"github.com/dyyyyy-1/chainlens/internal/store"
 )
@@ -62,6 +63,12 @@ func run() error {
 	}
 	defer client.Close()
 
+	// W1D3 阶段使用内置 ERC20 ABI；Etherscan 拉取与本地 ABI 文件加载在 W3 接入。
+	dec, err := decoder.New([]byte(decoder.ERC20ABI))
+	if err != nil {
+		return fmt.Errorf("indexer: build decoder: %w", err)
+	}
+
 	logger.Info("indexer started",
 		"chain_id", cfg.ChainID,
 		"contract", cfg.TargetContract,
@@ -70,7 +77,7 @@ func run() error {
 		"batch_blocks", cfg.BatchBlockRange,
 	)
 
-	scanner := indexer.New(client, client, st, indexer.Config{
+	scanner := indexer.New(client, client, st, dec, indexer.Config{
 		ChainID:       cfg.ChainID,
 		Contract:      common.HexToAddress(cfg.TargetContract),
 		StartBlock:    cfg.StartBlock,

@@ -11,6 +11,7 @@ import (
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/jackc/pgx/v5"
 
+	"github.com/dyyyyy-1/chainlens/internal/decoder"
 	"github.com/dyyyyy-1/chainlens/internal/store"
 )
 
@@ -32,7 +33,13 @@ type LogStore interface {
 	LoadCursor(ctx context.Context) (store.Cursor, error)
 	InsertHeaders(ctx context.Context, tx pgx.Tx, records []store.HeaderRecord) (int64, error)
 	InsertLogs(ctx context.Context, tx pgx.Tx, records []store.LogRecord) (int64, error)
+	InsertDecoded(ctx context.Context, tx pgx.Tx, records []store.DecodedRecord) (int64, error)
 	Advance(ctx context.Context, tx pgx.Tx, nextBlock, finalizedBlock uint64) error
+}
+
+// EventDecoder 把原始日志解码为结构化事件，由 internal/decoder 实现。
+type EventDecoder interface {
+	Decode(entry types.Log) decoder.Event
 }
 
 // Config 是索引器运行参数，取自 HANDOFF.md 第 10 节的环境变量。
@@ -50,16 +57,17 @@ type Scanner struct {
 	logs    LogFetcher
 	headers HeaderFetcher
 	store   LogStore
+	decoder EventDecoder
 	cfg     Config
 	logger  *slog.Logger
 }
 
 // New 构造索引器。logger 为 nil 时回落到 slog 默认实例。
-func New(logs LogFetcher, headers HeaderFetcher, st LogStore, cfg Config, logger *slog.Logger) *Scanner {
+func New(logs LogFetcher, headers HeaderFetcher, st LogStore, dec EventDecoder, cfg Config, logger *slog.Logger) *Scanner {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Scanner{logs: logs, headers: headers, store: st, cfg: cfg, logger: logger}
+	return &Scanner{logs: logs, headers: headers, store: st, decoder: dec, cfg: cfg, logger: logger}
 }
 
 // Run 持续扫描直到 ctx 结束。
@@ -129,6 +137,8 @@ func (s *Scanner) scanOnce(ctx context.Context) error {
 		logRecords = append(logRecords, store.NewLogRecord(raw, blockTime(header)))
 	}
 
+	decodedRecords, undecoded := s.decodeAll(rawLogs)
+
 	// ADR-1：区块数据与游标必须在同一事务内提交，否则崩溃会导致游标前进而数据缺失。
 	tx, err := s.store.Begin(ctx)
 	if err != nil {
@@ -144,6 +154,10 @@ func (s *Scanner) scanOnce(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	insertedDecoded, err := s.store.InsertDecoded(ctx, tx, decodedRecords)
+	if err != nil {
+		return err
+	}
 	if err := s.store.Advance(ctx, tx, blockRange.To+1, blockRange.To); err != nil {
 		return err
 	}
@@ -156,11 +170,59 @@ func (s *Scanner) scanOnce(ctx context.Context) error {
 		"to", blockRange.To,
 		"logs_fetched", len(rawLogs),
 		"logs_inserted", insertedLogs,
+		"decoded_inserted", insertedDecoded,
+		"decoded_undecodable", undecoded,
 		"headers_inserted", insertedHeaders,
 		"elapsed_ms", time.Since(started).Milliseconds(),
 	)
 
 	return nil
+}
+
+// decodeAll 解码整批日志，返回待入库记录与未能解码的条数。
+//
+// 单条解码失败只影响该条的状态，不中断同批其它日志，也不影响入库（HANDOFF.md 8.3）。
+func (s *Scanner) decodeAll(rawLogs []types.Log) ([]store.DecodedRecord, int) {
+	records := make([]store.DecodedRecord, 0, len(rawLogs))
+	undecoded := 0
+
+	for _, raw := range rawLogs {
+		event := s.decoder.Decode(raw)
+		if !event.IsDecoded() {
+			undecoded++
+			s.logUndecoded(raw, event)
+		}
+		records = append(records, store.DecodedRecord{
+			TxHash:    event.TxHash,
+			LogIndex:  event.LogIndex,
+			EventName: event.Name,
+			Status:    event.Status,
+			Payload:   event.Payload,
+		})
+	}
+
+	return records, undecoded
+}
+
+// logUndecoded 按原因分级记录。
+//
+// 「ABI 里没有这个事件」是常态——绝大多数合约只把少数事件写进我们手上的 ABI——
+// 用 Debug 避免刷屏；只有 ABI 命中却解不开（data 长度非法、indexed 超限）才是异常，用 Warn。
+func (s *Scanner) logUndecoded(raw types.Log, event decoder.Event) {
+	attributes := []any{
+		"tx", raw.TxHash.Hex(),
+		"log_index", raw.Index,
+		"topics", len(raw.Topics),
+		"data_len", len(raw.Data),
+		"reason", event.Reason,
+	}
+
+	switch event.Reason {
+	case decoder.ReasonMalformed, decoder.ReasonTooManyIndexed:
+		s.logger.Warn("log not decodable", attributes...)
+	default:
+		s.logger.Debug("log not decodable", attributes...)
+	}
 }
 
 // distinctBlockNumbers 返回日志涉及的块号，去重并升序，供批量拉取块头使用。
