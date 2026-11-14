@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/ethereum/go-ethereum"
+	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/ethclient"
 	"github.com/ethereum/go-ethereum/rpc"
@@ -24,6 +25,10 @@ const (
 
 	// rpcErrRateLimited 是 geth 与多数托管节点表达「请求过快」的错误码。
 	rpcErrRateLimited = -32005
+
+	// headerBatchSize 是单次 JSON-RPC 批量请求容纳的块头数。
+	// 逐块请求在 2000 块批下需要 2000 次往返，批量后降到 20 次。
+	headerBatchSize = 100
 
 	defaultRequestTimeout = 20 * time.Second
 	defaultMaxAttempts    = 3
@@ -135,6 +140,57 @@ func (c *Client) LatestBlockNumber(ctx context.Context) (uint64, error) {
 	}
 
 	return number, nil
+}
+
+// HeadersByRange 拉取一组指定高度的块头，用于补齐 chain_log.block_time。
+//
+// numbers 由调用方负责去重与升序。内部按 headerBatchSize 打包成 JSON-RPC 批量请求，
+// 单批内任一子请求失败即整批重试，避免部分成功的状态被静默接受。
+func (c *Client) HeadersByRange(ctx context.Context, numbers []uint64) (map[uint64]*types.Header, error) {
+	headers := make(map[uint64]*types.Header, len(numbers))
+	if len(numbers) == 0 {
+		return headers, nil
+	}
+
+	rawClient := c.eth.Client()
+
+	for start := 0; start < len(numbers); start += headerBatchSize {
+		chunk := numbers[start:min(start+headerBatchSize, len(numbers))]
+
+		err := c.withRetry(ctx, "get headers", func(callCtx context.Context) error {
+			elems := make([]rpc.BatchElem, len(chunk))
+			results := make([]*types.Header, len(chunk))
+
+			for i, number := range chunk {
+				results[i] = new(types.Header)
+				elems[i] = rpc.BatchElem{
+					Method: "eth_getBlockByNumber",
+					Args:   []any{hexutil.EncodeUint64(number), false},
+					Result: results[i],
+				}
+			}
+
+			if err := rawClient.BatchCallContext(callCtx, elems); err != nil {
+				return err
+			}
+
+			for i := range elems {
+				if elems[i].Error != nil {
+					return elems[i].Error
+				}
+				if results[i].Number == nil {
+					return fmt.Errorf("header %d: %w", chunk[i], ethereum.NotFound)
+				}
+				headers[chunk[i]] = results[i]
+			}
+			return nil
+		})
+		if err != nil {
+			return nil, fmt.Errorf("chain: headers %d..%d: %w", chunk[0], chunk[len(chunk)-1], err)
+		}
+	}
+
+	return headers, nil
 }
 
 // withRetry 以指数退避执行 call，仅对可恢复错误重试。
