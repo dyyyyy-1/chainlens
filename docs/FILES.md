@@ -1,0 +1,122 @@
+# 文件职责清单
+
+> **维护规则**：新增、删除或重命名任何文件，必须同步更新本表。评审时本表与目录结构不一致视为缺陷。
+
+路径全部相对于仓库根目录。
+
+---
+
+## 入口（`cmd/`）
+
+| 文件 | 职责 | 阶段 |
+|---|---|---|
+| `cmd/indexer/main.go` | 索引器进程入口。装载配置 → 建连接池与 RPC 客户端 → 构造解码器 → 启动 `indexer.Scanner`，响应 Ctrl-C 优雅退出。含 `validate()` 强制校验 `DATABASE_URL` 与 `TARGET_CONTRACT`。 | W1D2 |
+| `cmd/probe/main.go` | 临时探测工具。拉指定合约一段区间的日志并原样打印（块号、tx、log_index、topic0~3、data 长度），用于确认 topic 布局。**索引器稳定后可删除**。 | W1D1 |
+
+---
+
+## 领域层（`internal/`）
+
+### `internal/chain` —— JSON-RPC 访问
+
+| 文件 | 职责 | 阶段 |
+|---|---|---|
+| `client.go` | 连接管理、超时、重试、链 ID 校验。导出 `New` / `HeaderByNumber` / `LatestBlockNumber` / `HeadersByRange` / `Close`。 | W1D1、W1D2 |
+| `logs.go` | `Fetch`：按区块区间走 `eth_getLogs` 拉日志（ADR-2），带区间合法性校验与 2000 块上限。 | W1D1 |
+
+**为什么重试写在 `client.go` 而不是独立文件**：重试是调用语义的一部分，只有本包的调用点使用；抽出去反而要暴露内部状态。
+
+**为什么 `HeadersByRange` 用批量请求**：`chain_log.block_time` 是 `NOT NULL`，必须取块头。2000 块逐次请求等于 2000 次往返，批量后降到 20 次。
+
+### `internal/decoder` —— 日志解码
+
+| 文件 | 职责 | 阶段 |
+|---|---|---|
+| `registry.go` | 内置事件签名表（ERC20 / ERC721 / WETH / ERC1155 常见事件）。哈希在初始化时由签名串算出，不手抄常量。作用：没有 ABI 时仍能把 topic0 还原成可读事件名。 | W1D3 |
+| `abi.go` | ABI 解析与解码。`New` / `NewFromFile` / `Decode`。覆盖 §8.3 四种边界：anonymous 事件、indexed 超 3 个、ABI 缺失、data 长度非法。`normalize` 负责把 `big.Int` 转十进制字符串、地址转小写 hex。 | W1D3 |
+| `abi_test.go` | 上述四种边界 + Transfer/Approval 正常路径的表驱动测试。 | W1D3 |
+
+**为什么 `Decode` 不返回 `error`**：解码失败是预期内情况，未解码的日志同样要入库（`status = undecodable`）。返回 error 会诱导调用方中断整批，与 §8.3「不中断索引」冲突。失败原因放在 `Event.Reason`，只用于日志分级。
+
+**为什么用 `defer recover()` 包住解码**：`accounts/abi` 在畸形输入上存在 panic 路径，§8.3 明确要求「不 panic」。
+
+### `internal/indexer` —— 扫描主循环
+
+| 文件 | 职责 | 阶段 |
+|---|---|---|
+| `cursor.go` | `nextRange`：纯计算，无 IO。根据游标、链头、确认数、批量上限算出本批区间或「无活」。可独立单测。 | W1D2 |
+| `cursor_test.go` | `nextRange` 的 6 个边界用例（批量受限、水位受限、追平、head 低于确认数、batch=0）。 | W1D2 |
+| `scanner.go` | 主循环与单批流程：取区间 → 拉日志 → 补块头 → 解码 → 事务内写三张表 → 推进游标。同时在此声明 `LogFetcher` / `HeaderFetcher` / `LogStore` / `EventDecoder` 四个接口。 | W1D2、W1D3 |
+
+**为什么接口定义在这里**：§11 要求接口在使用方声明。`chain` 与 `store` 只提供具体类型，不反向依赖 indexer。
+
+**游标语义**：`next_block` 是下一个待扫高度；`to = min(next_block + batch - 1, head - confirmations)`，因此凡写入的数据都已越过确认数门槛。
+
+### `internal/store` —— 持久化
+
+| 文件 | 职责 | 阶段 |
+|---|---|---|
+| `models.go` | `Store` 类型、连接池构造与 `Begin`/`Close`；四个记录类型 `LogRecord` / `HeaderRecord` / `DecodedRecord` / `Cursor`；`NewLogRecord` 负责 `types.Log` → 记录的转换。 | W1D2、W1D3 |
+| `logs.go` | `InsertLogs`：临时表中转 + COPY + 幂等合并（见下）。 | W1D2 |
+| `headers.go` | `InsertHeaders`：`unnest` 数组参数一次写入多行块头。 | W1D2 |
+| `decoded.go` | `InsertDecoded`：`unnest` 写入解码结果，`payload` 以 JSON 文本传入后在库内转 `jsonb`。 | W1D3 |
+| `cursor.go` | `EnsureCursor` / `LoadCursor` / `Advance`。游标推进必须由调用方传入事务。 | W1D2 |
+
+**`logs.go` 为什么这么绕（临时表 → COPY → INSERT ... ON CONFLICT）**：
+PostgreSQL 的 `COPY` 协议不支持 `ON CONFLICT`，而 §8.4 同时要求「COPY 批量写」与「冲突时静默跳过」。解法是事务内建 `TEMP TABLE ... (LIKE chain_log) ON COMMIT DROP`（`LIKE` 默认不带主键约束，灌入不会因重复中断），COPY 进临时表后再用 `INSERT ... SELECT ... ON CONFLICT (tx_hash, log_index) DO NOTHING` 合并。返回值是 `RowsAffected()`，即**实际新增行数**——重扫时恒为 0，这就是幂等的判定依据。
+
+**`headers.go` / `decoded.go` 为什么超出 §5 的「models / logs / cursor」三文件**：§5 是骨架示意，`block_header` 与 `decoded_event` 的写入需要落点。塞进 `logs.go` 会把两种写职责混在一起，故各起一文件。这是已知且经确认的偏离。
+
+**`Store` 结构与构造器为什么放在 `models.go`**：同样是为了不再增加文件数（没有独立的 `store.go`）。
+
+### `internal/config`
+
+| 文件 | 职责 | 阶段 |
+|---|---|---|
+| `config.go` | 用标准库解析 `.env`（约 40 行，不引 godotenv），再映射到 `Config`。真实环境变量优先于文件；`.env` 不存在不报错。`RPC_HTTP_URL` 与 `CHAIN_ID` 必填。 | W1D1 |
+
+---
+
+## 数据定义（`migrations/`）
+
+| 文件 | 职责 | 阶段 |
+|---|---|---|
+| `0001_init.sql` | §6 的 5 张表 + `logs_hex` 调试视图，逐字转写。整文件包在 `BEGIN/COMMIT` 内。 | W1D1 |
+| `0002_decoded_event_status.sql` | 给 `decoded_event` 补 `status` 列（`decoded` / `undecodable`）。起因：§8.3 要求标记 undecodable，而 §6 没有状态列。状态独立成列而非塞进 `payload`。 | W1D3 |
+
+**migration 不可重复执行**：重跑 `0001` 会因表已存在而失败。本地重建用 `make db-reset`。版本追踪表留到 W2 再定。
+
+---
+
+## 工程配置
+
+| 文件 | 职责 | 阶段 |
+|---|---|---|
+| `Makefile` | `build` / `vet` / `fmt` / `fmt-check` / `migrate` / `db-reset` / `probe`。 | W1D1 |
+| `.env.example` | §10 的环境变量模板，入库。真实 `.env` 在 `.gitignore` 内。 | W1D1 |
+| `.gitignore` | 排除 `.env`、`.workbuddy/`（本地工作记录，含本机口令）、Go 构建产物。 | W1D1 |
+| `go.mod` / `go.sum` | 依赖锁定。仅 `go-ethereum` 与 `pgx/v5` 两个直接依赖，均来自 §3。 | W1D1 |
+
+---
+
+## 文档
+
+| 文件 | 职责 | 阶段 |
+|---|---|---|
+| `HANDOFF.md` | 项目设计与决策的唯一依据（定位、边界、ADR、数据模型、里程碑、规范）。**不随意改动**。 | 项目起始 |
+| `docs/FILES.md` | 本文件。 | W1D3 |
+
+---
+
+## 规划中、尚未创建
+
+按 §5 的目录结构，以下文件在对应里程碑之前不创建（避免空目录）：
+
+| 文件 | 里程碑 |
+|---|---|
+| `internal/decoder/proxy.go` | W2（EIP-1967 代理识别） |
+| `internal/indexer/reorg.go` | W2（分叉检测与回扫） |
+| `scripts/reorg-test/` | W2（anvil 分叉验证） |
+| `internal/profile/balance.go`、`approval.go` | W3（地址画像） |
+| `internal/api/router.go`、`handlers.go`、`cmd/api/main.go` | W3（查询服务） |
+| `web/` | W4（前端） |
