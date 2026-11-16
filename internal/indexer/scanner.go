@@ -123,7 +123,7 @@ func (s *Scanner) scanOnce(ctx context.Context) error {
 		return err
 	}
 
-	headers, err := s.headers.HeadersByRange(ctx, distinctBlockNumbers(rawLogs))
+	headers, err := s.headers.HeadersByRange(ctx, blockNumbers(blockRange.From, blockRange.To))
 	if err != nil {
 		return err
 	}
@@ -225,19 +225,21 @@ func (s *Scanner) logUndecoded(raw types.Log, event decoder.Event) {
 	}
 }
 
-// distinctBlockNumbers 返回日志涉及的块号，去重并升序，供批量拉取块头使用。
-func distinctBlockNumbers(logs []types.Log) []uint64 {
-	seen := make(map[uint64]struct{}, len(logs))
-	numbers := make([]uint64, 0, len(logs))
-	for _, entry := range logs {
-		if _, hasSeen := seen[entry.BlockNumber]; hasSeen {
-			continue
-		}
-		seen[entry.BlockNumber] = struct{}{}
-		numbers = append(numbers, entry.BlockNumber)
+// blockNumbers 生成闭区间内的全部块号，供批量拉取块头使用。
+//
+// 之所以写整段而不是只写「有日志的块」：reorg 检测要靠 parent_hash 把块头连成链
+// （HANDOFF.md 8.1），缺块就会让链断开、无法判断分叉深度。对高频合约两者的请求数
+// 几乎一致，对低频合约多出的几次批量调用可以忽略。
+func blockNumbers(from, to uint64) []uint64 {
+	if to < from {
+		return nil
 	}
 
-	slices.Sort(numbers)
+	numbers := make([]uint64, 0, to-from+1)
+	for number := from; number <= to; number++ {
+		numbers = append(numbers, number)
+	}
+
 	return numbers
 }
 

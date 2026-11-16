@@ -26,6 +26,10 @@ const (
 
 	// pollInterval 是追平链头后的轮询间隔。第 10 节的变量模板未定义该项，故取常量。
 	pollInterval = 5 * time.Second
+
+	// abiSourceFallback 对应 contract_meta.abi_source 的 fallback 取值：
+	// 当前用的是内置 ERC20 ABI，尚未从 Etherscan 获取（W3 接入）。
+	abiSourceFallback = "fallback"
 )
 
 func main() {
@@ -69,6 +73,14 @@ func run() error {
 		return fmt.Errorf("indexer: build decoder: %w", err)
 	}
 
+	contract := common.HexToAddress(cfg.TargetContract)
+
+	// 代理识别只在启动时做一次，结果写入 contract_meta。
+	// 失败不阻塞索引：日志本身不依赖 ABI，识别不到只会让解码退化（HANDOFF.md 8.3）。
+	if err := resolveContract(ctx, st, client, contract, logger); err != nil {
+		logger.Warn("contract resolution skipped", "address", contract.Hex(), "err", err)
+	}
+
 	logger.Info("indexer started",
 		"chain_id", cfg.ChainID,
 		"contract", cfg.TargetContract,
@@ -79,7 +91,7 @@ func run() error {
 
 	scanner := indexer.New(client, client, st, dec, indexer.Config{
 		ChainID:       cfg.ChainID,
-		Contract:      common.HexToAddress(cfg.TargetContract),
+		Contract:      contract,
 		StartBlock:    cfg.StartBlock,
 		Confirmations: cfg.Confirmations,
 		BatchBlocks:   cfg.BatchBlockRange,
@@ -100,5 +112,33 @@ func validate(cfg config.Config) error {
 	if !common.IsHexAddress(cfg.TargetContract) {
 		return fmt.Errorf("indexer: invalid TARGET_CONTRACT %q", cfg.TargetContract)
 	}
+	return nil
+}
+
+// resolveContract 识别目标合约的代理实现并写入 contract_meta。
+//
+// 识别范围见 decoder.Detect：EIP-1967 实现槽、EIP-1967 信标槽、ZeppelinOS 遗留槽、
+// EIP-1167 最小代理。USDC 属于第三种，用纯 EIP-1967 会漏判（HANDOFF.md 8.2）。
+func resolveContract(ctx context.Context, st *store.Store, reader decoder.ChainReader, addr common.Address, logger *slog.Logger) error {
+	info, err := decoder.Detect(ctx, reader, addr)
+	if err != nil {
+		return err
+	}
+
+	meta := store.ContractMeta{Address: addr, ABISource: abiSourceFallback}
+	if info.IsProxy() {
+		implementation := info.Implementation
+		meta.Implementation = &implementation
+	}
+	if err := st.UpsertContractMeta(ctx, meta); err != nil {
+		return err
+	}
+
+	logger.Info("contract resolved",
+		"address", addr.Hex(),
+		"proxy_kind", string(info.Kind),
+		"implementation", info.Implementation.Hex(),
+	)
+
 	return nil
 }
