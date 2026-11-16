@@ -30,7 +30,12 @@ const (
 	// 逐块请求在 2000 块批下需要 2000 次往返，批量后降到 20 次。
 	headerBatchSize = 100
 
-	defaultRequestTimeout = 20 * time.Second
+	// defaultRequestTimeout 是单次 JSON-RPC 调用的超时上限。
+	//
+	// 取 60s 而非更小的值：USDC 这类高频合约在 2000 块批量下，单次 eth_getLogs
+	// 实测耗时 41.6s、响应体 97 MB。超时设成 20s 会让每次请求都踩线并触发重传，
+	// 白白多传近 100 MB。
+	defaultRequestTimeout = 60 * time.Second
 	defaultMaxAttempts    = 3
 	defaultRetryBaseDelay = 500 * time.Millisecond
 	maxRetryBackoff       = 8 * time.Second
