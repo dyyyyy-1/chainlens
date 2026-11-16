@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/ethereum/go-ethereum"
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/ethclient"
@@ -148,7 +149,6 @@ func (c *Client) LatestBlockNumber(ctx context.Context) (uint64, error) {
 }
 
 // HeadersByRange 拉取一组指定高度的块头，用于补齐 chain_log.block_time。
-//
 // numbers 由调用方负责去重与升序。内部按 headerBatchSize 打包成 JSON-RPC 批量请求，
 // 单批内任一子请求失败即整批重试，避免部分成功的状态被静默接受。
 func (c *Client) HeadersByRange(ctx context.Context, numbers []uint64) (map[uint64]*types.Header, error) {
@@ -196,6 +196,68 @@ func (c *Client) HeadersByRange(ctx context.Context, numbers []uint64) (map[uint
 	}
 
 	return headers, nil
+}
+
+// StorageAt 读取账户指定存储槽的 32 字节值。
+//
+// 代理识别（internal/decoder/proxy.go）用它读 EIP-1967 一类槽位。
+func (c *Client) StorageAt(ctx context.Context, addr common.Address, slot common.Hash) (common.Hash, error) {
+	var raw []byte
+
+	err := c.withRetry(ctx, "get storage", func(callCtx context.Context) error {
+		value, err := c.eth.StorageAt(callCtx, addr, slot, nil)
+		if err != nil {
+			return err
+		}
+		raw = value
+		return nil
+	})
+	if err != nil {
+		return common.Hash{}, fmt.Errorf("chain: storage %s of %s: %w", slot.Hex(), addr.Hex(), err)
+	}
+	if len(raw) != common.HashLength {
+		return common.Hash{}, fmt.Errorf("chain: storage %s of %s: got %d bytes, want %d", slot.Hex(), addr.Hex(), len(raw), common.HashLength)
+	}
+
+	return common.BytesToHash(raw), nil
+}
+
+// CodeAt 读取账户字节码。返回空表示该地址是 EOA 或未部署合约。
+func (c *Client) CodeAt(ctx context.Context, addr common.Address) ([]byte, error) {
+	var code []byte
+
+	err := c.withRetry(ctx, "get code", func(callCtx context.Context) error {
+		value, err := c.eth.CodeAt(callCtx, addr, nil)
+		if err != nil {
+			return err
+		}
+		code = value
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("chain: code of %s: %w", addr.Hex(), err)
+	}
+
+	return code, nil
+}
+
+// Call 以 eth_call 执行只读调用，用于从信标合约取回实现地址。
+func (c *Client) Call(ctx context.Context, to common.Address, data []byte) ([]byte, error) {
+	var result []byte
+
+	err := c.withRetry(ctx, "call contract", func(callCtx context.Context) error {
+		out, err := c.eth.CallContract(callCtx, ethereum.CallMsg{To: &to, Data: data}, nil)
+		if err != nil {
+			return err
+		}
+		result = out
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("chain: call %s: %w", to.Hex(), err)
+	}
+
+	return result, nil
 }
 
 // withRetry 以指数退避执行 call，仅对可恢复错误重试。

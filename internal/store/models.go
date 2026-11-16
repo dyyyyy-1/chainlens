@@ -95,6 +95,17 @@ type DecodedRecord struct {
 	Payload   map[string]any
 }
 
+// ContractMeta 是 contract_meta 一行在内存中的形态。
+//
+// Implementation 为 nil 表示识别结果不是代理；ABI 为 nil 表示尚未获取。
+type ContractMeta struct {
+	Address        common.Address
+	Implementation *common.Address
+	ABI            []byte
+	ABISource      string
+	ResolvedAt     time.Time
+}
+
 // NewLogRecord 把 RPC 返回的原始日志转换为可写入 chain_log 的记录。
 //
 // topic 数量可变（0~4），超出部分置空；data 为 nil 时写入空串以满足 NOT NULL 约束。
