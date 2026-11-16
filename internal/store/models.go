@@ -75,6 +75,12 @@ type HeaderRecord struct {
 	IsFinalized bool
 }
 
+// HeaderTip 是本地已写入的最高块头，reorg 检测用它判定与链上是否仍然一致。
+type HeaderTip struct {
+	Number uint64
+	Hash   common.Hash
+}
+
 // Cursor 是 index_cursor 单行表的快照。
 //
 // NextBlock 表示下一个待扫描的高度；FinalizedBlock 是已确认水位。

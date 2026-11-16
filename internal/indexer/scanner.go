@@ -35,6 +35,10 @@ type LogStore interface {
 	InsertLogs(ctx context.Context, tx pgx.Tx, records []store.LogRecord) (int64, error)
 	InsertDecoded(ctx context.Context, tx pgx.Tx, records []store.DecodedRecord) (int64, error)
 	Advance(ctx context.Context, tx pgx.Tx, nextBlock, finalizedBlock uint64) error
+	PromoteFinalized(ctx context.Context, tx pgx.Tx, fromExclusive, toInclusive uint64) (int64, error)
+	LocalTip(ctx context.Context) (store.HeaderTip, bool, error)
+	HeaderHashAt(ctx context.Context, number uint64) (common.Hash, bool, error)
+	DeleteFrom(ctx context.Context, tx pgx.Tx, number uint64) (int64, error)
 }
 
 // EventDecoder 把原始日志解码为结构化事件，由 internal/decoder 实现。
@@ -96,7 +100,7 @@ func (s *Scanner) Run(ctx context.Context) error {
 	}
 }
 
-// scanOnce 完成一个批次的完整流程：取区间、拉日志、补块头、落库、推进游标。
+// scanOnce 完成一个批次的完整流程：取区间、校验分叉、拉日志、补块头、落库、推进游标。
 func (s *Scanner) scanOnce(ctx context.Context) error {
 	cursor, err := s.store.LoadCursor(ctx)
 	if err != nil {
@@ -111,7 +115,22 @@ func (s *Scanner) scanOnce(ctx context.Context) error {
 		return err
 	}
 
-	blockRange, hasWork := nextRange(cursor.NextBlock, head, s.cfg.Confirmations, s.cfg.BatchBlocks)
+	// 分叉检测每轮都做，且必须早于「是否还有活」的判定：
+	// 追平之后 next_block 已越过链头，但重组正是在那时发生的。
+	fork, hasReorg, err := s.checkReorg(ctx)
+	if err != nil {
+		return err
+	}
+	if hasReorg {
+		if err := s.applyReorg(ctx, fork, cursor.FinalizedBlock); err != nil {
+			return err
+		}
+		if cursor, err = s.store.LoadCursor(ctx); err != nil {
+			return err
+		}
+	}
+
+	blockRange, hasWork := nextRange(cursor.NextBlock, head, s.cfg.BatchBlocks)
 	if !hasWork {
 		return nil
 	}
@@ -139,6 +158,13 @@ func (s *Scanner) scanOnce(ctx context.Context) error {
 
 	decodedRecords, undecoded := s.decodeAll(rawLogs)
 
+	// 确认数水位：本轮写入的块中，块号不超过它的才算已确认。
+	finalizedUpTo := uint64(0)
+	safeBlockNumber, hasSafe := safeBlock(head, s.cfg.Confirmations)
+	if hasSafe {
+		finalizedUpTo = safeBlockNumber
+	}
+
 	// ADR-1：区块数据与游标必须在同一事务内提交，否则崩溃会导致游标前进而数据缺失。
 	tx, err := s.store.Begin(ctx)
 	if err != nil {
@@ -146,7 +172,7 @@ func (s *Scanner) scanOnce(ctx context.Context) error {
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	insertedHeaders, err := s.store.InsertHeaders(ctx, tx, headerRecords(headers, blockRange.To))
+	insertedHeaders, err := s.store.InsertHeaders(ctx, tx, headerRecords(headers, finalizedUpTo))
 	if err != nil {
 		return err
 	}
@@ -158,7 +184,23 @@ func (s *Scanner) scanOnce(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if err := s.store.Advance(ctx, tx, blockRange.To+1, blockRange.To); err != nil {
+
+	// 晋升：把本批中已越过确认数的块头标记为已确认，并推进 finalized_block。
+	// 上界取 min(水位, 本批末尾)，保证 finalized_block 不越过实际已索引的范围。
+	newFinalized := cursor.FinalizedBlock
+	promoted := int64(0)
+	if hasSafe {
+		promoteTo := min(safeBlockNumber, blockRange.To)
+		if promoteTo > newFinalized {
+			promoted, err = s.store.PromoteFinalized(ctx, tx, newFinalized, promoteTo)
+			if err != nil {
+				return err
+			}
+			newFinalized = promoteTo
+		}
+	}
+
+	if err := s.store.Advance(ctx, tx, blockRange.To+1, newFinalized); err != nil {
 		return err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -168,6 +210,9 @@ func (s *Scanner) scanOnce(ctx context.Context) error {
 	s.logger.Info("batch committed",
 		"from", blockRange.From,
 		"to", blockRange.To,
+		"head", head,
+		"finalized_block", newFinalized,
+		"promoted", promoted,
 		"logs_fetched", len(rawLogs),
 		"logs_inserted", insertedLogs,
 		"decoded_inserted", insertedDecoded,
