@@ -105,6 +105,7 @@ PostgreSQL 的 `COPY` 协议不支持 `ON CONFLICT`，而 §8.4 同时要求「C
 |---|---|---|
 | `HANDOFF.md` | 项目设计与决策的唯一依据（定位、边界、ADR、数据模型、里程碑、规范）。**不随意改动**。 | 项目起始 |
 | `docs/FILES.md` | 本文件。 | W1D3 |
+| `docs/BENCHMARK.md` | W1 压测记录：`eth_getLogs` 容量、归档限制、批量对吞吐的影响、内存与存储占用、幂等结论、全量索引时间估算。W4 写 README 时从这里取数。 | W1 收尾 |
 
 ---
 
