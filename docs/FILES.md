@@ -48,7 +48,8 @@
 |---|---|---|
 | `cursor.go` | `nextRange`：纯计算，无 IO。根据游标、链头、确认数、批量上限算出本批区间或「无活」。可独立单测。 | W1D2 |
 | `cursor_test.go` | `nextRange` 的 6 个边界用例（批量受限、水位受限、追平、head 低于确认数、batch=0）。 | W1D2 |
-| `scanner.go` | 主循环与单批流程：取区间 → 拉日志 → 补块头 → 解码 → 事务内写四张表 → 推进游标。块头按**整段区间**写入（`blockNumbers`），因为 reorg 检测要靠 `parent_hash` 把块头连成链，缺块就会断开。同时在此声明 `LogFetcher` / `HeaderFetcher` / `LogStore` / `EventDecoder` 四个接口。 | W1D2、W1D3、W2D1 |
+| `scanner.go` | 主循环与单批流程：取区间 → 校验分叉 → 拉日志 → 补块头 → 解码 → 事务内写四张表 → 晋升确认水位 → 推进游标。块头按**整段区间**写入（`blockNumbers`），因为 reorg 检测要靠 `parent_hash` 把块头连成链，缺块就会断开。同时在此声明 `LogFetcher` / `HeaderFetcher` / `LogStore` / `EventDecoder` 四个接口。 | W1D2、W1D3、W2D1、W2D2 |
+| `reorg.go` | 分叉检测与回滚。`checkReorg` 比对本地 tip 与链上同高度哈希；`findForkPoint` 在 `maxReorgDepth`（128）窗口内批量拉块头回溯共同祖先；`applyReorg` 在事务内删数据并把游标退回分叉点。**每轮都执行**，且早于「是否还有活」的判定——重组最容易发生在追平之后。 | W2D2 |
 
 **为什么接口定义在这里**：§11 要求接口在使用方声明。`chain` 与 `store` 只提供具体类型，不反向依赖 indexer。
 
@@ -102,6 +103,14 @@ PostgreSQL 的 `COPY` 协议不支持 `ON CONFLICT`，而 §8.4 同时要求「C
 
 ---
 
+## 脚本（`scripts/`）
+
+| 文件 | 职责 | 阶段 |
+|---|---|---|
+| `scripts/reorg-test/run.sh` | reorg 端到端验证（§8.1 验收）。fork 主网 → 索引到链头 → 冒充 USDC 持有者转一笔真实转账 → 再挖两块 → `anvil_reorg` 深度 5 → 断言：分叉点识别、陈旧日志被删、块头换成新哈希、游标回退。使用独立库 `chainlens_anvil`，不触碰开发库。 | W2D2 |
+
+---
+
 ## 文档
 
 | 文件 | 职责 | 阶段 |
@@ -118,9 +127,6 @@ PostgreSQL 的 `COPY` 协议不支持 `ON CONFLICT`，而 §8.4 同时要求「C
 
 | 文件 | 里程碑 |
 |---|---|
-| `internal/decoder/proxy.go` | W2（EIP-1967 代理识别） |
-| `internal/indexer/reorg.go` | W2（分叉检测与回扫） |
-| `scripts/reorg-test/` | W2（anvil 分叉验证） |
 | `internal/profile/balance.go`、`approval.go` | W3（地址画像） |
 | `internal/api/router.go`、`handlers.go`、`cmd/api/main.go` | W3（查询服务） |
 | `web/` | W4（前端） |
