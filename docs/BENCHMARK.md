@@ -29,21 +29,25 @@ USDC 的日志密度约 **65~70 条/块**，所以 2000 块批对应约 14 万�
 
 ### 2.1 各免费端点实测
 
-测试条件：查询 2023 年区块 `18,000,000..18,000,019` 的 USDC 日志，任何「仅限最近 N 块」的端点都会拒绝。
+三个维度都要测：归档查询、JSON-RPC 批量能力、单请求延迟。只测其中一个会选错端点。
 
-| 端点 | 结果 |
-|---|---|
-| `ethereum-rpc.publicnode.com` | ❌ 403 `Archive requests require a personal token` |
-| `eth.llamarpc.com` | ❌ HTTP 525（TLS 握手失败） |
-| `1rpc.io/eth` | ❌ `method not available` |
-| `cloudflare-eth.com` | ❌ `Internal error` |
-| **`eth.drpc.org`** | ✅ 返回 102 条日志，1.2 s |
-| **`rpc.flashbots.net`** | ✅ 返回 115 条日志，2.4 s |
+| 端点 | 归档 `eth_getLogs` | JSON-RPC 批量 | 结论 |
+|---|---|---|---|
+| `ethereum-rpc.publicnode.com` | ❌ 仅最近约 8,000 块 | ✅ 100 个/批，4.4 s | **选用** |
+| `eth.drpc.org` | ✅ | ❌ 最多 3 个/批 | 归档备选，与块头批量冲突 |
+| `rpc.flashbots.net` | ✅ | ❌ 10 个即被拒 | 不适用 |
+| `eth.llamarpc.com` | — | — | HTTP 525（TLS 握手失败） |
+| `1rpc.io/eth` | ❌ `method not available` | — | 不可用 |
+| `cloudflare-eth.com` | ❌ `Internal error` | — | 不可用 |
 
-两个可用端点都支持 W2 需要的 `eth_getStorageAt` 与 `eth_getCode`。选 **`eth.drpc.org`**：
-延迟更低，连续 5 次请求无节流（0.85~1.24 s），定位是通用只读 RPC 而非交易所专用通道。
+**没有任何免费端点同时满足「可查归档」与「支持批量」。**
 
-`ethereum-rpc.publicnode.com` 保留作为「只查最近窗口」场景的备选。
+本项目的块头获取依赖批量请求（2000 块 = 20 次 `eth_getBlockByNumber`，逐条则需 2000 次），
+因此选 **publicnode**，并把演示区间限定在最近约 8,000 块。
+
+若将来需要全量回扫：换 Alchemy / Infura 免费档（同时支持归档与批量），只改 `RPC_HTTP_URL`，
+不需要动任何代码。若只是临时查历史，把 `RPC_HTTP_URL` 指向 `eth.drpc.org` 也能用，
+但 `headerBatchSize`（100）会超出其免费额度，需要一并调整。
 
 ### 2.2 publicnode 的可用窗口
 
@@ -53,13 +57,22 @@ USDC 的日志密度约 **65~70 条/块**，所以 2000 块批对应约 14 万�
 | 10,000 / 12,000 块 | ❌ 归档请求被拒 |
 
 免费档只能覆盖最近约 **8,000~9,000 块**（约 27 小时链上时间）。
-换到 `eth.drpc.org` 后不再受此限制，全量回扫在技术上可行。
+这意味着索引器若停机超过一天，`next_block` 会落到窗口之外而失败——属于已知限制，
+重启时把 `index_start` 拨到窗口内即可。
 
-### 2.3 对项目的影响
+### 2.3 评估端点时的教训
 
-HANDOFF 第 2 节要求的「从部署块到链头」全量回扫，在 publicnode 上做不到，在 drpc 上可以但很慢
-（见第 8 节：USDC 约需 6.3 天）。因此实际演示区间需要按「够用且有说服力」来裁剪，
-而不是真跑全量。`RPC_HTTP_URL` 本来就是环境变量，切换端点不需要改任何代码。
+第一轮只测了单请求能不能查归档，据此选了 drpc；等接入「块头批量请求」后立刻收到
+`400 Batch of more than 3 requests are not allowed on free plan`。
+端点评估必须把**实际调用模式**（批量大小、并发）一起测，否则结论不成立。
+
+### 2.4 对项目的影响
+
+HANDOFF 第 2 节要求的「从部署块到链头」全量回扫，在 publicnode 免费档上做不到
+（窗口约 8,000 块），在 drpc 上可以但批量受限、在本项目里跑不动。
+
+因此实际演示区间按「够用且有说服力」裁剪，而不是真跑全量。`RPC_HTTP_URL` 本来就是环境变量，
+需要全量回扫时切换到 Alchemy / Infura 免费档即可，不改代码。
 
 ## 3. 端到端吞吐（批量大小的决定性影响）
 

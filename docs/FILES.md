@@ -10,7 +10,7 @@
 
 | 文件 | 职责 | 阶段 |
 |---|---|---|
-| `cmd/indexer/main.go` | 索引器进程入口。装载配置 → 建连接池与 RPC 客户端 → 构造解码器 → 启动 `indexer.Scanner`，响应 Ctrl-C 优雅退出。含 `validate()` 强制校验 `DATABASE_URL` 与 `TARGET_CONTRACT`。 | W1D2 |
+| `cmd/indexer/main.go` | 索引器进程入口。装载配置 → 建连接池与 RPC 客户端 → 识别目标合约的代理实现并写入 `contract_meta` → 构造解码器 → 启动 `indexer.Scanner`，响应 Ctrl-C 优雅退出。含 `validate()` 强制校验 `DATABASE_URL` 与 `TARGET_CONTRACT`。代理识别失败只告警不阻塞索引。 | W1D2、W2D1 |
 | `cmd/probe/main.go` | 临时探测工具。拉指定合约一段区间的日志并原样打印（块号、tx、log_index、topic0~3、data 长度），用于确认 topic 布局。**索引器稳定后可删除**。 | W1D1 |
 
 ---
@@ -35,6 +35,8 @@
 | `registry.go` | 内置事件签名表（ERC20 / ERC721 / WETH / ERC1155 常见事件）。哈希在初始化时由签名串算出，不手抄常量。作用：没有 ABI 时仍能把 topic0 还原成可读事件名。 | W1D3 |
 | `abi.go` | ABI 解析与解码。`New` / `NewFromFile` / `Decode`。覆盖 §8.3 四种边界：anonymous 事件、indexed 超 3 个、ABI 缺失、data 长度非法。`normalize` 负责把 `big.Int` 转十进制字符串、地址转小写 hex。 | W1D3 |
 | `abi_test.go` | 上述四种边界 + Transfer/Approval 正常路径的表驱动测试。 | W1D3 |
+| `proxy.go` | 代理识别。声明 `ChainReader` 接口（由 `internal/chain` 实现），按优先级探测四种模式：EIP-1967 实现槽 → EIP-1967 信标槽（`eth_call` 取实现） → ZeppelinOS 遗留槽 → EIP-1167 最小代理字节码。**USDC 属于第三种**，只做 EIP-1967 会漏判。 | W2D1 |
+| `proxy_test.go` | 用 `fakeReader` 覆盖四种代理 + EOA + 普通合约 + 信标调用失败，全部脱离网络。 | W2D1 |
 
 **为什么 `Decode` 不返回 `error`**：解码失败是预期内情况，未解码的日志同样要入库（`status = undecodable`）。返回 error 会诱导调用方中断整批，与 §8.3「不中断索引」冲突。失败原因放在 `Event.Reason`，只用于日志分级。
 
@@ -46,7 +48,7 @@
 |---|---|---|
 | `cursor.go` | `nextRange`：纯计算，无 IO。根据游标、链头、确认数、批量上限算出本批区间或「无活」。可独立单测。 | W1D2 |
 | `cursor_test.go` | `nextRange` 的 6 个边界用例（批量受限、水位受限、追平、head 低于确认数、batch=0）。 | W1D2 |
-| `scanner.go` | 主循环与单批流程：取区间 → 拉日志 → 补块头 → 解码 → 事务内写三张表 → 推进游标。同时在此声明 `LogFetcher` / `HeaderFetcher` / `LogStore` / `EventDecoder` 四个接口。 | W1D2、W1D3 |
+| `scanner.go` | 主循环与单批流程：取区间 → 拉日志 → 补块头 → 解码 → 事务内写四张表 → 推进游标。块头按**整段区间**写入（`blockNumbers`），因为 reorg 检测要靠 `parent_hash` 把块头连成链，缺块就会断开。同时在此声明 `LogFetcher` / `HeaderFetcher` / `LogStore` / `EventDecoder` 四个接口。 | W1D2、W1D3、W2D1 |
 
 **为什么接口定义在这里**：§11 要求接口在使用方声明。`chain` 与 `store` 只提供具体类型，不反向依赖 indexer。
 
@@ -60,6 +62,7 @@
 | `logs.go` | `InsertLogs`：临时表中转 + COPY + 幂等合并（见下）。 | W1D2 |
 | `headers.go` | `InsertHeaders`：`unnest` 数组参数一次写入多行块头。 | W1D2 |
 | `decoded.go` | `InsertDecoded`：`unnest` 写入解码结果，`payload` 以 JSON 文本传入后在库内转 `jsonb`。 | W1D3 |
+| `meta.go` | `UpsertContractMeta` / `LoadContractMeta`：代理识别结果的读写。`abi` 用 `COALESCE` 更新，避免重复解析时把已获取的 ABI 覆盖成空。 | W2D1 |
 | `cursor.go` | `EnsureCursor` / `LoadCursor` / `Advance`。游标推进必须由调用方传入事务。 | W1D2 |
 
 **`logs.go` 为什么这么绕（临时表 → COPY → INSERT ... ON CONFLICT）**：
