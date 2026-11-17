@@ -21,7 +21,7 @@ W1（索引链路）、W2（代理识别 + 最终性 + reorg 回滚）、W3D1（
 |---|---|
 | 远程 | `https://github.com/dyyyyy-1/chainlens.git`（**Public**） |
 | 分支 | `main`，本地与远程同步 |
-| 提交数 | 32 个（本节数字会随提交变化，以 `git log --oneline \| wc -l` 为准） |
+| 提交数 | 38 个（本节数字会随提交变化，以 `git log --oneline \| wc -l` 为准） |
 | 推送凭据 | 系统级 `credential.helper=manager` + Windows 凭据库已有 `github.com` 条目，**`git push` 无需交互** |
 
 推送偶发 `schannel: failed to receive handshake`。**这不是凭据问题**——同期 `curl https://github.com` 返回 200、`git ls-remote` 能通，是写方向的 TLS 抖动，直接重试即可。若持续失败，可试 `git -c http.sslBackend=openssl push`。
@@ -58,23 +58,23 @@ GOSUMDB=sum.golang.org GOPROXY=https://goproxy.cn,direct go mod tidy
 | W2 | 多槽位代理识别、最终性窗口（`is_finalized`）、reorg 回滚、anvil 验证 | ✅ 完成 |
 | W3D1 | Sourcify ABI 拉取、按实现地址取 ABI、验证区间未解码率 1.48% → 0% | ✅ 完成 |
 | W3D2 | 地址画像查询层（`Holdings` / `Approvals` / `Interactions`），`internal/profile` | ✅ 完成 |
-| W3D3 | HTTP API（5 个端点）+ `cmd/api` | ⬜ **下一步** |
-| W4 | 与 Etherscan 对拍、前端、README | ⬜ 未开始 |
+| W3D3 | HTTP API（5 个端点）+ `cmd/api` | ✅ 完成 |
+| W4 | 与 Etherscan 对拍、前端、README | ⬜ **下一步** |
 
 ---
 
 ## 4. 当前数据状态
 
-`chainlens` 库快照（2026-11-17 14:20，索引器**正在运行**，数字持续增长）：
+`chainlens` 库快照（2026-11-17 14:50，索引器**已停机**，数字稳定）：
 
 | 指标 | 值 |
 |---|---|
-| `chain_log` 行数 | 836,939 |
-| 已索引区间 | 26422714 .. 26432909 |
-| `chain_log` 总大小 | 313 MB |
-| `decoded_event` | decoded 832,961 / undecodable 3,978 |
-| `index_cursor` | `next_block=26432910`，`finalized_block=26432897`，`chain_id=1` |
-| `block_header` | 10,196 行，其中 `is_finalized=false` 12 行（确认数窗口） |
+| `chain_log` 行数 | 848,735 |
+| 已索引区间 | 26422714 .. 26433029 |
+| `chain_log` 总大小 | 318 MB |
+| `decoded_event` | decoded 844,757 / undecodable 3,978 |
+| `index_cursor` | `next_block=26433030`，`finalized_block=26433017`，`chain_id=1` |
+| `block_header` | 10,316 行，其中 `is_finalized=false` 12 行（确认数窗口） |
 | `contract_meta` | USDC，`abi_source=sourcify`，72 条目，implementation `0x4350...02dd` |
 | 事件分布 | Transfer 约占 90%，其余为 Approval / Mint / Burn / AuthorizationUsed / unknown 3,978 |
 
@@ -109,6 +109,9 @@ GOSUMDB=sum.golang.org GOPROXY=https://goproxy.cn,direct go mod tidy
 | 5 | §5 `internal/profile/` 只有 `balance.go` / `approval.go` | 增加 `interaction.go` | 交互、持仓、授权三类聚合口径不同，合并到两个文件会让语义混杂 | 用户确认 |
 | 6 | §8.1 隐含索引未确认区 | W1 阶段只扫到 `head - confirmations`，`is_finalized` 恒为 true | 当时为缩小 W1 范围；**已在 W2D2 回归 §8.1**，此条已关闭 | — |
 | 7 | §7 `Decoder.Decode(log) (DecodedEvent, error)` | `decoder.Decode(log) Event`，**不返回 error**，失败用 `Status`/`Reason` 表达 | 返回 error 会诱导调用方中断整批，与 §8.3「解码失败不中断索引」直接冲突 | 本会话说明，未单独确认 |
+| 8 | §5 `internal/store/` 只列 `models` / `logs` / `cursor` | 再加 `query.go`（只读查询面：事件、区间、统计）与 `Pool()` | 写路径服务于索引器的事务语义，读路径服务于查询服务；混在一个文件会让两种事务要求纠缠。`Pool()` 是「一个进程一套连接池」的接线点 | 用户授权本次自行决定 |
+| 9 | §5 查询服务路由用 **chi** | 用标准库 `ServeMux`（Go 1.22+ 的「方法 + 路径参数」模式） | 本服务只有五条静态路由，`ServeMux` 完全覆盖；为一个 router 增加一条直接依赖不划算，`go.mod` 仍保持两个直接依赖 | 用户授权本次自行决定 |
+| 10 | §7 `GET /api/stats` 含「追平延迟」 | 给 `stale_seconds`（最新区块时间与当前时刻之差），不给「落后多少块」 | 块级落后必须接 RPC 查链头，会让只读服务多一个外部依赖与一种失败模式；时间差同样能判断数据新鲜度 | 用户授权本次自行决定 |
 
 补充说明（第 4 条）：ADR-3 的原始理由是"为全量地址预计算持仓成本极高"。查本地库**不做预计算**、不建聚合表、不建缓存表，只有查询，因此与该理由不冲突。查询侧的硬约束是用户另行提出的："必须有过滤、禁止全量扫描"，落实为 `LIMIT` + `statement_timeout` + 地址左填充 32 字节。
 
@@ -231,18 +234,42 @@ GOSUMDB=sum.golang.org GOPROXY=https://goproxy.cn,direct go mod tidy
 - `Interactions` 因当前只索引一个合约，只会返回一行；多合约后才有分布意义。
 - 因此 HANDOFF §8.5 的验收「与 Etherscan 数字一致」在部分区间上不成立，W4 对拍目标应改为「区间内事件聚合一致」。
 
-### W3D3 —— HTTP API（下一步）
+### W3D3 —— HTTP API（✅ 已完成 2026-11-17）
 
-- `internal/api/router.go` + `handlers.go`（chi）、`cmd/api/main.go`
-- 5 个端点按 HANDOFF §7；响应带 `coverage`（已索引区间）
-- **已知衔接问题**：`store.Store` 把 `*pgxpool.Pool` 藏在私有字段里，`cmd/api` 拿不到 pool 就无法构造 `profile.New`。要么给 `store` 加一个只读访问器，要么让 `cmd/api` 自建 pool（`profile` 只要求 `BeginTx`，两条路都通）。
-- `ErrQueryTimeout` 应映射成 503，不要落入通用 500。。
+产出：`internal/api/{router,handlers,handlers_test}.go`、`cmd/api/main.go`，以及 `internal/store/query.go`（事件检索 / 覆盖区间 / 统计）。
+
+五个端点，全部只读，响应统一带 `coverage`：
+
+| 方法 | 路径 | 主要参数 |
+|---|---|---|
+| GET | `/api/events` | `contract`、`from`、`to`、`limit`、`offset` |
+| GET | `/api/address/{addr}/balances` | `limit` |
+| GET | `/api/address/{addr}/approvals` | `limit` |
+| GET | `/api/address/{addr}/interactions` | `limit` |
+| GET | `/api/stats` | — |
+
+实测（848,735 行、索引器停机）：`/api/events` 2 ms、`/api/stats` 176 ms、`/balances` 214 ms、`/interactions` 102 ms、`/approvals` 12 ms。
+
+实现要点：
+
+- **连接池只有一个**：`cmd/api` 调一次 `store.New`，再用 `profile.New(st.Pool())` 复用同一个池。实测 `pg_stat_activity` 中该库只有 1 条业务连接，不存在两套池。
+- **超时分层**：请求预算 5 s > profile 的 `statement_timeout` 3 s，让数据库先超时，从而返回可解释的 503 `query_timeout`，而不是笼统的请求超时。
+- **错误映射**：`ErrQueryTimeout` / `context.DeadlineExceeded` → 503；其余 → 500，SQL 细节只进日志（测试里断言响应不含 `SQLSTATE` 与表名）。
+- **输出约定**：地址与哈希统一小写（ADR-4），时间统一 UTC RFC3339，金额一律十进制字符串（`uint256` 超出 JS 安全整数范围）。
+- 非 GET 请求由 `ServeMux` 的 `GET` 模式自动回 405。
+
+W4 之前需要知道的限制：
+
+- `/api/events` 的 `OFFSET` 深翻页会退化，需要游标分页时再补。
+- `/api/stats` 的计数是 `count(*)` 全表聚合，全量索引 USDC 后会变成秒级，届时要改计数表或物化视图（与「不预计算」约束冲突，需要重新权衡）。
+- 无鉴权、无限流，只适合本机或内网。
 
 ### W4 —— 收尾
 
-- 与 Etherscan 对拍（在已索引区间内误差应为 0）
-- README（数字取自 `docs/BENCHMARK.md`）
+- 与 Etherscan 对拍：**目标是「已索引区间内的事件聚合一致」**，不是余额一致（见上一节语义边界）
+- README（数字取自 `docs/BENCHMARK.md`，但该文档记的 51~59 s/2000 块已被实测的 118~142 s 取代，需重测）
 - 前端（可选）
+- 可选加固：限流、鉴权、游标分页
 
 ---
 
@@ -259,6 +286,11 @@ go build ./... && go vet ./... && go test ./... && ~/go/bin/gofumpt -l .
 # 跑索引器（依赖本地 .env，已 gitignore）
 go run ./cmd/indexer
 
+# 跑查询服务（默认 :8080，HTTP_ADDR 可覆盖）
+go run ./cmd/api
+curl -s localhost:8080/api/stats
+curl -s "localhost:8080/api/address/0x000000000004444c5dc75cb358380d2e3de08a90/balances"
+
 # 探测某区间的日志布局
 go run ./cmd/probe
 
@@ -270,7 +302,8 @@ PGPASSWORD=chainlens_dev psql "postgres://chainlens:chainlens_dev@localhost:5432
 ```
 
 `.env` 关键项：`DATABASE_URL`、`RPC_HTTP_URL=https://ethereum-rpc.publicnode.com`、`CHAIN_ID=1`、
-`TARGET_CONTRACT=0xA0b8...eB48`、`START_BLOCK=26422714`、`CONFIRMATIONS=12`、`BATCH_BLOCK_RANGE=2000`。
+`TARGET_CONTRACT=0xA0b8...eB48`、`START_BLOCK=26422714`、`CONFIRMATIONS=12`、`BATCH_BLOCK_RANGE=2000`、
+`HTTP_ADDR=:8080`（仅查询服务读取）。
 
 ---
 

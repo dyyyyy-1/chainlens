@@ -12,6 +12,7 @@
 |---|---|---|
 | `cmd/indexer/main.go` | 索引器进程入口。装载配置 → 建连接池与 RPC 客户端 → 识别目标合约的代理实现并写入 `contract_meta` → 构造解码器 → 启动 `indexer.Scanner`，响应 Ctrl-C 优雅退出。含 `validate()` 强制校验 `DATABASE_URL` 与 `TARGET_CONTRACT`。代理识别失败只告警不阻塞索引。 | W1D2、W2D1 |
 | `cmd/probe/main.go` | 临时探测工具。拉指定合约一段区间的日志并原样打印（块号、tx、log_index、topic0~3、data 长度），用于确认 topic 布局。**索引器稳定后可删除**。 | W1D1 |
+| `cmd/api/main.go` | 查询服务入口。装载配置 → **只建一个连接池**（`store.New`）→ `profile.New(st.Pool())` 复用同一个池 → 启动 `http.Server` 并处理优雅退出。含 `ReadHeaderTimeout` / `IdleTimeout` / `Shutdown` 三项超时。 | W3D3 |
 
 ---
 
@@ -67,6 +68,7 @@
 | `decoded.go` | `InsertDecoded`：`unnest` 写入解码结果，`payload` 以 JSON 文本传入后在库内转 `jsonb`。 | W1D3 |
 | `meta.go` | `UpsertContractMeta` / `LoadContractMeta`：代理识别结果的读写。`abi` 用 `COALESCE` 更新，避免重复解析时把已获取的 ABI 覆盖成空。 | W2D1 |
 | `cursor.go` | `EnsureCursor` / `LoadCursor` / `Advance`。游标推进必须由调用方传入事务。 | W1D2 |
+| `query.go` | 只读查询面：`ListEvents`（按合约/区间过滤，条件按需拼接）、`Coverage`（已索引区间）、`Stats`（水位 + 事件计数）。与写路径分开：写路径服务于索引器的事务语义，读路径服务于查询服务。 | W3D3 |
 
 **`logs.go` 为什么这么绕（临时表 → COPY → INSERT ... ON CONFLICT）**：
 PostgreSQL 的 `COPY` 协议不支持 `ON CONFLICT`，而 §8.4 同时要求「COPY 批量写」与「冲突时静默跳过」。解法是事务内建 `TEMP TABLE ... (LIKE chain_log) ON COMMIT DROP`（`LIKE` 默认不带主键约束，灌入不会因重复中断），COPY 进临时表后再用 `INSERT ... SELECT ... ON CONFLICT (tx_hash, log_index) DO NOTHING` 合并。返回值是 `RowsAffected()`，即**实际新增行数**——重扫时恒为 0，这就是幂等的判定依据。
@@ -74,6 +76,8 @@ PostgreSQL 的 `COPY` 协议不支持 `ON CONFLICT`，而 §8.4 同时要求「C
 **`headers.go` / `decoded.go` 为什么超出 §5 的「models / logs / cursor」三文件**：§5 是骨架示意，`block_header` 与 `decoded_event` 的写入需要落点。塞进 `logs.go` 会把两种写职责混在一起，故各起一文件。这是已知且经确认的偏离。
 
 **`Store` 结构与构造器为什么放在 `models.go`**：同样是为了不再增加文件数（没有独立的 `store.go`）。
+
+**`Store.Pool()` 为什么存在**：`internal/profile` 需要连接池，而一个进程只能有一套池。若让 profile 自建，数据库侧看到的总连接数是两套上限之和，两边超时与回收互不知情，排查连接数异常时会误导判断。`cmd/api` 因此只调一次 `store.New`，把同一个池交给 `profile.New`。该方法只供同进程只读组件复用，写路径仍在 Store 上。
 
 ### `internal/profile` —— 地址画像查询
 
@@ -94,11 +98,25 @@ PostgreSQL 的 `COPY` 协议不支持 `ON CONFLICT`，而 §8.4 同时要求「C
 
 **`Profile` 为什么只依赖窄接口而不是 `*pgxpool.Pool`**：§11 要求接口在使用方声明，`profile` 不 import `store`，也不绑死具体连接池实现。`*pgxpool.Pool` 恰好满足 `BeginTx`，直接传入即可。
 
+### `internal/api` —— 查询服务 HTTP 层
+
+| 文件 | 职责 | 阶段 |
+|---|---|---|
+| `router.go` | 路由（5 个端点）、`EventStore` / `ProfileReader` 两个窄接口、请求中间件（超时预算、panic 恢复、访问日志、状态码记录）。 | W3D3 |
+| `handlers.go` | 参数解析与校验、错误映射（超时 → 503、内部错误 → 500 且不泄露 SQL）、响应 DTO 与 `coverage` 封装、hex 与时间格式化。 | W3D3 |
+| `handlers_test.go` | 全离线的假实现测试：路由匹配、地址/区间/limit 校验、超时映射、错误不泄露内部细节、大写地址统一转小写、`2^256-1` 精确输出。 | W3D3 |
+
+**为什么用标准库 `ServeMux` 而不是 chi**：`HANDOFF.md` 第 5 节写的是 chi，但 Go 1.22+ 的 `ServeMux` 已支持 `GET /api/address/{addr}/balances` 这种「方法 + 路径参数」模式，本服务五条静态路由完全覆盖。为一个 router 增加一条直接依赖不划算，差异已登记在 `docs/SESSION-HANDOFF.md` §5.1。
+
+**为什么 `coverage` 随每个响应返回，而不是只在 `/api/stats`**：单看某个地址的空结果，无法区分「该地址确实没有记录」与「这段历史还没索引」。前者是数据结论，后者是数据缺口，混为一谈会得出错误判断。
+
+**为什么 `handlers.go` 里没有 SQL**：查询与聚合在 `store`（事件、统计、区间）和 `profile`（画像）里，api 只做校验、编排与序列化。把 SQL 放进 handler 会让「换传输层」变成重写。
+
 ### `internal/config`
 
 | 文件 | 职责 | 阶段 |
 |---|---|---|
-| `config.go` | 用标准库解析 `.env`（约 40 行，不引 godotenv），再映射到 `Config`。真实环境变量优先于文件；`.env` 不存在不报错。`RPC_HTTP_URL` 与 `CHAIN_ID` 必填。 | W1D1 |
+| `config.go` | 用标准库解析 `.env`（约 40 行，不引 godotenv），再映射到 `Config`。真实环境变量优先于文件；`.env` 不存在不报错。`RPC_HTTP_URL` 与 `CHAIN_ID` 必填——**仅对 `Load`（索引器）**；`LoadServer`（查询服务）只要求 `DATABASE_URL` 与 `HTTP_ADDR`。 | W1D1、W3D3 |
 
 ---
 
@@ -118,9 +136,9 @@ PostgreSQL 的 `COPY` 协议不支持 `ON CONFLICT`，而 §8.4 同时要求「C
 | 文件 | 职责 | 阶段 |
 |---|---|---|
 | `Makefile` | `build` / `vet` / `fmt` / `fmt-check` / `migrate` / `db-reset` / `probe`。 | W1D1 |
-| `.env.example` | §10 的环境变量模板，入库。真实 `.env` 在 `.gitignore` 内。 | W1D1 |
+| `.env.example` | §10 的环境变量模板，入库。真实 `.env` 在 `.gitignore` 内。W3D3 追加 `HTTP_ADDR`（仅查询服务读取）。 | W1D1、W3D3 |
 | `.gitignore` | 排除 `.env`、`.workbuddy/`（本地工作记录，含本机口令）、Go 构建产物。 | W1D1 |
-| `go.mod` / `go.sum` | 依赖锁定。仅 `go-ethereum` 与 `pgx/v5` 两个直接依赖，均来自 §3。 | W1D1 |
+| `go.mod` / `go.sum` | 依赖锁定。仍只有 `go-ethereum` 与 `pgx/v5` 两个直接依赖。查询服务的路由用标准库 `ServeMux`，没有引入 chi（见 `internal/api` 一节）。 | W1D1、W3D3 |
 
 ---
 
@@ -149,6 +167,5 @@ PostgreSQL 的 `COPY` 协议不支持 `ON CONFLICT`，而 §8.4 同时要求「C
 
 | 文件 | 里程碑 / 状态 |
 |---|---|
-| `internal/api/router.go`、`handlers.go`、`cmd/api/main.go` | W3D3（查询服务） |
 | `web/` | W4（前端） |
 | `cmd/redecode/main.go` | **用户明确暂缓**。用途：按区间删除 `decoded_event` 后回退游标重解，支持分批与断点。起因是切换 ABI 不会回溯重解，存量 3,978 条 `undecodable` 需要它才能安全修正。详见 `docs/SESSION-HANDOFF.md` §8。 |
