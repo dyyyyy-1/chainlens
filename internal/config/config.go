@@ -23,12 +23,15 @@ type Config struct {
 	Confirmations   uint64
 	BatchBlockRange uint64
 	LogLevel        slog.Level
+	// HTTPAddr 是查询服务的监听地址，仅 cmd/api 使用。
+	HTTPAddr string
 }
 
 // .env 模板中的缺省值，仅在对应环境变量为空时生效。
 const (
 	defaultConfirmations   = 12
 	defaultBatchBlockRange = 2000
+	defaultHTTPAddr        = ":8080"
 )
 
 // Load 先读取 envFile（可为空串或不存在），再从进程环境变量解析配置。
@@ -46,6 +49,7 @@ func Load(envFile string) (Config, error) {
 		RPCHTTPURL:      strings.TrimSpace(os.Getenv("RPC_HTTP_URL")),
 		EtherscanAPIKey: os.Getenv("ETHERSCAN_API_KEY"),
 		TargetContract:  strings.TrimSpace(os.Getenv("TARGET_CONTRACT")),
+		HTTPAddr:        httpAddr(),
 	}
 	if cfg.RPCHTTPURL == "" {
 		return Config{}, errors.New("config: RPC_HTTP_URL is required")
@@ -75,6 +79,39 @@ func Load(envFile string) (Config, error) {
 	}
 
 	return cfg, nil
+}
+
+// LoadServer 装载查询服务所需的配置。
+//
+// 查询服务只读数据库、不访问链，因此**不要求** RPC_HTTP_URL 与 CHAIN_ID。
+// 这是它与索引器唯一的分歧：多要求一个用不到的变量，会让 api 在只缺 RPC 时
+// 报出与真实原因无关的错误。
+func LoadServer(envFile string) (Config, error) {
+	if envFile != "" {
+		if err := loadEnvFile(envFile); err != nil {
+			return Config{}, err
+		}
+	}
+
+	cfg := Config{
+		DatabaseURL: os.Getenv("DATABASE_URL"),
+		HTTPAddr:    httpAddr(),
+	}
+
+	var err error
+	if cfg.LogLevel, err = parseLogLevel("LOG_LEVEL"); err != nil {
+		return Config{}, err
+	}
+
+	return cfg, nil
+}
+
+// httpAddr 返回监听地址，未设置时用 :8080。
+func httpAddr() string {
+	if addr := strings.TrimSpace(os.Getenv("HTTP_ADDR")); addr != "" {
+		return addr
+	}
+	return defaultHTTPAddr
 }
 
 // loadEnvFile 解析 KEY=VALUE 形式的 .env 文件，忽略空行与 # 注释。
