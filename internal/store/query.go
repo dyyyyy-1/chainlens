@@ -158,6 +158,73 @@ func (s *Store) Coverage(ctx context.Context) (Coverage, error) {
 	return coverage, nil
 }
 
+// logsByRangeSQL 按区块区间读取原始日志。
+const logsByRangeSQL = `
+SELECT block_number, block_time, tx_hash, log_index, contract,
+       topic0, topic1, topic2, topic3, data
+FROM chain_log
+WHERE block_number BETWEEN $1 AND $2
+ORDER BY block_number, log_index`
+
+// LogsByRange 读取区间内的原始日志，供对拍与导出使用。
+//
+// 这是唯一一条可能一次返回大量行的查询：调用方必须自己控制区间宽度
+// （cmd/verify 默认 500 块一批）。按 (block_number, log_index) 排序，
+// 走 idx_log_block 的区间扫描。
+func (s *Store) LogsByRange(ctx context.Context, from, to uint64) ([]LogRecord, error) {
+	if from > to {
+		return nil, fmt.Errorf("store: invalid block range %d..%d", from, to)
+	}
+
+	rows, err := s.pool.Query(ctx, logsByRangeSQL, int64(from), int64(to))
+	if err != nil {
+		return nil, fmt.Errorf("store: logs by range %d..%d: %w", from, to, err)
+	}
+	defer rows.Close()
+
+	records := make([]LogRecord, 0, 1024)
+	for rows.Next() {
+		var (
+			record                 LogRecord
+			txHash, contract       []byte
+			topic0, topic1, topic2 []byte
+			topic3, data           []byte
+			logIndex               int32
+		)
+		if err := rows.Scan(
+			&record.BlockNumber, &record.BlockTime, &txHash, &logIndex, &contract,
+			&topic0, &topic1, &topic2, &topic3, &data,
+		); err != nil {
+			return nil, fmt.Errorf("store: scan log: %w", err)
+		}
+
+		record.TxHash = common.BytesToHash(txHash)
+		record.LogIndex = uint32(logIndex)
+		record.Contract = common.BytesToAddress(contract)
+		record.Topic0 = hashPtr(topic0)
+		record.Topic1 = hashPtr(topic1)
+		record.Topic2 = hashPtr(topic2)
+		record.Topic3 = hashPtr(topic3)
+		record.Data = data
+
+		records = append(records, record)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: logs by range %d..%d: %w", from, to, err)
+	}
+
+	return records, nil
+}
+
+// hashPtr 把可空 topic 列转成指针：NULL 与空字节都视为缺失。
+func hashPtr(raw []byte) *common.Hash {
+	if len(raw) == 0 {
+		return nil
+	}
+	hash := common.BytesToHash(raw)
+	return &hash
+}
+
 // countSQL 统计日志与解码状态。
 //
 // 这是全表聚合，代价随表线性增长。当前量级（百万行以内）在几十毫秒，
