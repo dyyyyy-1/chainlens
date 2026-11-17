@@ -13,6 +13,8 @@
 | `cmd/indexer/main.go` | 索引器进程入口。装载配置 → 建连接池与 RPC 客户端 → 识别目标合约的代理实现并写入 `contract_meta` → 构造解码器 → 启动 `indexer.Scanner`，响应 Ctrl-C 优雅退出。含 `validate()` 强制校验 `DATABASE_URL` 与 `TARGET_CONTRACT`。代理识别失败只告警不阻塞索引。 | W1D2、W2D1 |
 | `cmd/probe/main.go` | 临时探测工具。拉指定合约一段区间的日志并原样打印（块号、tx、log_index、topic0~3、data 长度），用于确认 topic 布局。**索引器稳定后可删除**。 | W1D1 |
 | `cmd/api/main.go` | 查询服务入口。装载配置 → **只建一个连接池**（`store.New`）→ `profile.New(st.Pool())` 复用同一个池 → 启动 `http.Server` 并处理优雅退出。含 `ReadHeaderTimeout` / `IdleTimeout` / `Shutdown` 三项超时。 | W3D3 |
+| `cmd/verify/main.go` | 回放对拍工具。对同一区间重新 `eth_getLogs`，与 `chain_log` 按 `(tx_hash, log_index)` 逐字段比对（含 `block_time`），报告缺失/多余/不一致。**运行时二分探测归档边界**，只核对可回放部分，不把「超出窗口」误报成「数据缺失」。退出码 0/1/2。 | W4 |
+| `cmd/verify/main_test.go` | 证明比对函数**能发现差异**（缺失 / 多余 / data 改动 / 块时间漂移），以及区间收敛的边界。没有这组用例，「0 差异」的结论不可信。 | W4 |
 
 ---
 
@@ -68,7 +70,7 @@
 | `decoded.go` | `InsertDecoded`：`unnest` 写入解码结果，`payload` 以 JSON 文本传入后在库内转 `jsonb`。 | W1D3 |
 | `meta.go` | `UpsertContractMeta` / `LoadContractMeta`：代理识别结果的读写。`abi` 用 `COALESCE` 更新，避免重复解析时把已获取的 ABI 覆盖成空。 | W2D1 |
 | `cursor.go` | `EnsureCursor` / `LoadCursor` / `Advance`。游标推进必须由调用方传入事务。 | W1D2 |
-| `query.go` | 只读查询面：`ListEvents`（按合约/区间过滤，条件按需拼接）、`Coverage`（已索引区间）、`Stats`（水位 + 事件计数）。与写路径分开：写路径服务于索引器的事务语义，读路径服务于查询服务。 | W3D3 |
+| `query.go` | 只读查询面：`ListEvents`（按合约/区间过滤，条件按需拼接）、`Coverage`（已索引区间）、`Stats`（水位 + 事件计数）、`LogsByRange`（区间原始日志，供 `cmd/verify` 对拍与导出）。与写路径分开：写路径服务于索引器的事务语义，读路径服务于查询服务。 | W3D3、W4 |
 
 **`logs.go` 为什么这么绕（临时表 → COPY → INSERT ... ON CONFLICT）**：
 PostgreSQL 的 `COPY` 协议不支持 `ON CONFLICT`，而 §8.4 同时要求「COPY 批量写」与「冲突时静默跳过」。解法是事务内建 `TEMP TABLE ... (LIKE chain_log) ON COMMIT DROP`（`LIKE` 默认不带主键约束，灌入不会因重复中断），COPY 进临时表后再用 `INSERT ... SELECT ... ON CONFLICT (tx_hash, log_index) DO NOTHING` 合并。返回值是 `RowsAffected()`，即**实际新增行数**——重扫时恒为 0，这就是幂等的判定依据。
@@ -154,6 +156,7 @@ PostgreSQL 的 `COPY` 协议不支持 `ON CONFLICT`，而 §8.4 同时要求「C
 
 | 文件 | 职责 | 阶段 |
 |---|---|---|
+| `README.md` | 项目门面：定位、快速开始、架构、数据模型、关键设计的取舍、实测性能、API 与错误码、**局限（部分区间 / 无第三方交叉 / 无鉴权）**。 | W4 |
 | `HANDOFF.md` | 项目设计与决策的唯一依据（定位、边界、ADR、数据模型、里程碑、规范）。**不随意改动**。 | 项目起始 |
 | `docs/FILES.md` | 本文件。 | W1D3 |
 | `docs/BENCHMARK.md` | W1 压测记录：`eth_getLogs` 容量、归档限制、批量对吞吐的影响、内存与存储占用、幂等结论、全量索引时间估算。W4 写 README 时从这里取数。 | W1 收尾 |
