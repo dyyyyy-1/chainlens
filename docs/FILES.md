@@ -120,6 +120,7 @@ PostgreSQL 的 `COPY` 协议不支持 `ON CONFLICT`，而 §8.4 同时要求「C
 | `HANDOFF.md` | 项目设计与决策的唯一依据（定位、边界、ADR、数据模型、里程碑、规范）。**不随意改动**。 | 项目起始 |
 | `docs/FILES.md` | 本文件。 | W1D3 |
 | `docs/BENCHMARK.md` | W1 压测记录：`eth_getLogs` 容量、归档限制、批量对吞吐的影响、内存与存储占用、幂等结论、全量索引时间估算。W4 写 README 时从这里取数。 | W1 收尾 |
+| `docs/SESSION-HANDOFF.md` | **新会话的第一个入口**。记录当前进度、本机环境与口令位置、数据快照、已踩过的坑、待决策清单、遗留问题、常用命令、协作约定。与 `HANDOFF.md` 的分工：那份是设计依据（几乎不变），这份是运行状态（随时更新）。 | W3D1 结束 |
 
 ---
 
@@ -127,8 +128,9 @@ PostgreSQL 的 `COPY` 协议不支持 `ON CONFLICT`，而 §8.4 同时要求「C
 
 按 §5 的目录结构，以下文件在对应里程碑之前不创建（避免空目录）：
 
-| 文件 | 里程碑 |
+| 文件 | 里程碑 / 状态 |
 |---|---|
-| `internal/profile/balance.go`、`approval.go` | W3（地址画像） |
-| `internal/api/router.go`、`handlers.go`、`cmd/api/main.go` | W3（查询服务） |
+| `internal/profile/balance.go`、`approval.go` | W3D2（地址画像查询层） |
+| `internal/api/router.go`、`handlers.go`、`cmd/api/main.go` | W3D3（查询服务） |
 | `web/` | W4（前端） |
+| `cmd/redecode/main.go` | **用户明确暂缓**。用途：按区间删除 `decoded_event` 后回退游标重解，支持分批与断点。起因是切换 ABI 不会回溯重解，存量 3,978 条 `undecodable` 需要它才能安全修正。详见 `docs/SESSION-HANDOFF.md` §8。 |
