@@ -26,6 +26,24 @@ W1（索引链路）、W2（代理识别 + 最终性 + reorg 回滚）、W3D1（
 
 推送偶发 `schannel: failed to receive handshake`。**这不是凭据问题**——同期 `curl https://github.com` 返回 200、`git ls-remote` 能通，是写方向的 TLS 抖动，直接重试即可。若持续失败，可试 `git -c http.sslBackend=openssl push`。
 
+**2026-11-17 补充：TLS 报错可能根本不是 TLS 问题，先查代理。** 本机 `git config --get-all http.proxy` 指向 `http://127.0.0.1:10808`，而环境变量 `HTTPS_PROXY` 是 `http://127.0.0.1:55692`。实测 10808 已无监听（`curl -x` 超时、`http_code=000`），55692 正常。
+
+诊断顺序（照这个走，不要先怀疑凭据或 TLS）：
+
+```bash
+curl -s -o /dev/null -w "%{http_code}\n" -m 8 https://github.com            # 走环境代理
+curl -s -o /dev/null -w "%{http_code}\n" -m 8 -x http://127.0.0.1:10808 https://github.com
+git config --get-all http.proxy ; echo "$HTTPS_PROXY"
+```
+
+修复用**单次覆盖**，不要改全局配置（代理端口会随客户端重启变化）：
+
+```bash
+git -c http.proxy=http://127.0.0.1:55692 push origin main
+```
+
+`schannel` 与 `openssl` 两种后端在同一代理下都会失败，所以「换后端」这个老办法治标不治本。
+
 ---
 
 ## 2. 本机环境
