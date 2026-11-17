@@ -21,7 +21,7 @@ W1（索引链路）、W2（代理识别 + 最终性 + reorg 回滚）、W3D1（
 |---|---|
 | 远程 | `https://github.com/dyyyyy-1/chainlens.git`（**Public**） |
 | 分支 | `main`，本地与远程同步 |
-| 提交数 | 25 个，最新 `9a1264b` |
+| 提交数 | 32 个（本节数字会随提交变化，以 `git log --oneline \| wc -l` 为准） |
 | 推送凭据 | 系统级 `credential.helper=manager` + Windows 凭据库已有 `github.com` 条目，**`git push` 无需交互** |
 
 推送偶发 `schannel: failed to receive handshake`。**这不是凭据问题**——同期 `curl https://github.com` 返回 200、`git ls-remote` 能通，是写方向的 TLS 抖动，直接重试即可。若持续失败，可试 `git -c http.sslBackend=openssl push`。
@@ -57,29 +57,30 @@ GOSUMDB=sum.golang.org GOPROXY=https://goproxy.cn,direct go mod tidy
 | W1 | 区间扫描 → `eth_getLogs` → COPY 幂等落库 → 解码 → 重扫行数不变 | ✅ 完成并压测 |
 | W2 | 多槽位代理识别、最终性窗口（`is_finalized`）、reorg 回滚、anvil 验证 | ✅ 完成 |
 | W3D1 | Sourcify ABI 拉取、按实现地址取 ABI、验证区间未解码率 1.48% → 0% | ✅ 完成 |
-| **W3D2** | **地址画像查询层（`Holdings` / `Approvals` / `Interactions`）** | ⬜ **下一步** |
-| W3D3 | HTTP API（5 个端点）+ `cmd/api` | ⬜ 未开始 |
+| W3D2 | 地址画像查询层（`Holdings` / `Approvals` / `Interactions`），`internal/profile` | ✅ 完成 |
+| W3D3 | HTTP API（5 个端点）+ `cmd/api` | ⬜ **下一步** |
 | W4 | 与 Etherscan 对拍、前端、README | ⬜ 未开始 |
 
 ---
 
 ## 4. 当前数据状态
 
-`chainlens` 库快照（2026-11-17）：
+`chainlens` 库快照（2026-11-17 14:20，索引器**正在运行**，数字持续增长）：
 
 | 指标 | 值 |
 |---|---|
-| `chain_log` 行数 | 267,698 |
-| 已索引区间 | 26422714 .. 26426599 |
-| `chain_log` 总大小 | 100 MB |
-| `decoded_event` | decoded 263,720 / undecodable 3,978 |
-| `index_cursor` | `next_block=26426600`，`finalized_block=26426599`，`chain_id=1` |
-| `block_header` | 3,886 行，全部 `is_finalized=true` |
+| `chain_log` 行数 | 836,939 |
+| 已索引区间 | 26422714 .. 26432909 |
+| `chain_log` 总大小 | 313 MB |
+| `decoded_event` | decoded 832,961 / undecodable 3,978 |
+| `index_cursor` | `next_block=26432910`，`finalized_block=26432897`，`chain_id=1` |
+| `block_header` | 10,196 行，其中 `is_finalized=false` 12 行（确认数窗口） |
 | `contract_meta` | USDC，`abi_source=sourcify`，72 条目，implementation `0x4350...02dd` |
+| 事件分布 | Transfer 约占 90%，其余为 Approval / Mint / Burn / AuthorizationUsed / unknown 3,978 |
 
 目标合约：主网 USDC `0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48`，链 ID 1。
 
-**重要**：索引器没有常驻，数据停在 26426599，比链头落后约 6,000 块。接手后要先跑索引器追平（publicnode 窗口约 8,000 块，拖太久会因归档限制失败）。
+索引器按需手动 `go run`，非常驻。追平后停顿会让 `next_block` 落到 publicnode 的约 8,000 块窗口之外，届时会被判成归档请求而失败（§8.5）。
 
 那 3,978 条 `undecodable` 是**内置 ABI 时代的存量**，切 Sourcify 不会回溯重解，见 §8。
 
@@ -105,7 +106,7 @@ GOSUMDB=sum.golang.org GOPROXY=https://goproxy.cn,direct go mod tidy
 | 2 | §6 `decoded_event` 无状态列 | 增加 `status text NOT NULL DEFAULT 'decoded' CHECK (status IN ('decoded','undecodable'))`（`migrations/0002`） | §8.3 要求标记 `undecodable`，原表无处安放 | 用户确认（方案 C） |
 | 3 | §2/§3 ABI 用 Etherscan API | 改用 Sourcify v2（无需 key） | 不接受代注册第三方账号；Sourcify 免 key 且实测可用 | 用户确认 |
 | 4 | **ADR-3 画像用 `eth_getLogs` 按 topic1/topic2 实时查 + 内存缓存 5 分钟** | **改查本地 `chain_log`（已有 `topic1`/`topic2` 索引）** | 免费端点 `eth_getLogs` 跨度上限：publicnode 约 8,000 块、drpc 10,000 块，画像只能覆盖约 33 小时，产品语义失效。本地库无跨度限制且无 RPC 成本，同时仍不违反 ADR-3 的本意（**不预计算**） | 用户确认（方案 B） |
-| 5 | §5 `internal/profile/` 只有 `balance.go` / `approval.go` | 计划增加 `interaction.go` | 交互、持仓、授权三类聚合口径不同，合并到两个文件会让语义混杂 | 待确认 |
+| 5 | §5 `internal/profile/` 只有 `balance.go` / `approval.go` | 增加 `interaction.go` | 交互、持仓、授权三类聚合口径不同，合并到两个文件会让语义混杂 | 用户确认 |
 | 6 | §8.1 隐含索引未确认区 | W1 阶段只扫到 `head - confirmations`，`is_finalized` 恒为 true | 当时为缩小 W1 范围；**已在 W2D2 回归 §8.1**，此条已关闭 | — |
 | 7 | §7 `Decoder.Decode(log) (DecodedEvent, error)` | `decoder.Decode(log) Event`，**不返回 error**，失败用 `Status`/`Reason` 表达 | 返回 error 会诱导调用方中断整批，与 §8.3「解码失败不中断索引」直接冲突 | 本会话说明，未单独确认 |
 
@@ -195,25 +196,47 @@ GOSUMDB=sum.golang.org GOPROXY=https://goproxy.cn,direct go mod tidy
 
 ---
 
-## 9. 下一步任务
+## 9. 任务进度与下一步
 
-### W3D2 —— 地址画像查询层（下一步）
+### W3D2 —— 地址画像查询层（✅ 已完成 2026-11-17）
 
-**包路径以 `HANDOFF.md` §5 为准：`internal/profile/`，不是 `internal/store/`。**
+产出（`internal/profile/`，四个文件，逐文件职责见 `docs/FILES.md`）：`Holdings` / `Approvals` / `Interactions`，外加 `profile_test.go`。
 
-- `internal/profile/balance.go`：`Holdings(ctx, addr, limit)` —— 按合约聚合 Transfer 净额
-- `internal/profile/approval.go`：`Approvals(ctx, addr, limit)` —— 按 `(contract, spender)` 取最新一条，标注无限额度 `2^256-1`
-- `internal/profile/interaction.go`：`Interactions(ctx, addr, limit)` —— 最近交互的合约
-  （§5 只列了 balance/approval 两个文件，第三个属**新增偏离**，理由：交互与持仓、授权的聚合口径不同，合并会让单文件承担三类语义）
-- 数据访问用「使用方声明接口」：profile 内部定义窄接口（只读 `Query`），由 `store` 或 `*pgxpool.Pool` 满足，**不直接依赖 `store` 包的具体类型**，避免 store 变成画像逻辑的堆场。
-- SQL 归 profile 所有：画像查询是跨表只读聚合（`chain_log` + `decoded_event`），且带业务规则（净额、去重、无限额度），放在 store 里会让 store 承担业务语义。
-- 全部走 `idx_log_topic1` / `idx_log_topic2`。已用 `EXPLAIN ANALYZE` 验证：252k 行、单地址 11,288 行命中，`Bitmap Index Scan`，13 ms。
-- 硬约束落实：`LIMIT`、`statement_timeout`、地址左填充 32 字节、无预计算表。
+设计要点：
 
-### W3D3 —— HTTP API
+- **窄接口**：profile 只声明 `Querier`（一个 `BeginTx` 方法），`*pgxpool.Pool` 直接满足，不 import `store`。
+- **SQL 归 profile 所有**：画像是带业务规则的只读聚合（净额、去重、无限额度），放 store 会让 store 承担业务语义。
+- **执行骨架**：`READ ONLY` 事务 → `set_config(..., true)` 设 `statement_timeout='3s'` 与 `work_mem='16MB'` → 查询 → 回滚。用事务级设置，避免连接池复用时把配置残留给下一个请求。
+- **必须带过滤**：`LIMIT` 收敛到 200；超时（SQLSTATE 57014）翻译成 `ErrQueryTimeout`，供 API 层映射 503。
+- **不建预计算表、缓存表、物化视图、DB 函数**：`u256` 换算以 SQL 常量内联。
+
+实测（836,939 行 / 10,196 块时；最热地址 56.5k 行）：
+
+| 方法 | 最坏耗时 | 冷地址 |
+|---|---|---|
+| `Holdings` | 200 ms | 0.2 ms |
+| `Approvals`（2,905 条 → 13 个 spender） | 14.6 ms | — |
+| `Interactions` | 105 ms | 0.06 ms |
+
+三条踩过的坑：
+
+1. **PostgreSQL 17 不支持 `bit(256)::numeric`**，无法直接把 32 字节 `data` 转数值。解法是拆 8 个 32 位分肢乘 2 的幂。已与 `decoded_event` 的十进制 `payload.value` 在 24 万条 Transfer 上逐条对账，零差异。
+2. **默认 `work_mem` 会导致磁盘溢写**：最热地址的 `GroupAggregate` 排序需要约 9 MB，4 MB 默认值下溢写 7 MB。事务内设 16 MB 后排序回内存，耗时 225 ms → 200 ms。
+3. **`topic0` 过滤的选择率估算偏差 200 倍**（估 259 行 / 实际 56,499 行），planner 因此选了 `GroupAggregate`。不要用 `enable_sort=off` 这类全局开关压制，靠 `work_mem` 解决即可。
+
+**语义边界（已写进代码注释，不要在 API 层改写成「余额」）**：
+
+- `Holding.Net` 是**已索引区间内的净变化**，不是链上余额，活跃地址可能为负。要真实余额必须查链上 `balanceOf()`。
+- `Approval` 是区间内该 `(contract, spender)` 的最新一条日志，**不代表链上当前 allowance**：区间外的后续授权或撤销不可见。
+- `Interactions` 因当前只索引一个合约，只会返回一行；多合约后才有分布意义。
+- 因此 HANDOFF §8.5 的验收「与 Etherscan 数字一致」在部分区间上不成立，W4 对拍目标应改为「区间内事件聚合一致」。
+
+### W3D3 —— HTTP API（下一步）
 
 - `internal/api/router.go` + `handlers.go`（chi）、`cmd/api/main.go`
-- 5 个端点按 HANDOFF §7；响应带 `coverage`（已索引区间）。
+- 5 个端点按 HANDOFF §7；响应带 `coverage`（已索引区间）
+- **已知衔接问题**：`store.Store` 把 `*pgxpool.Pool` 藏在私有字段里，`cmd/api` 拿不到 pool 就无法构造 `profile.New`。要么给 `store` 加一个只读访问器，要么让 `cmd/api` 自建 pool（`profile` 只要求 `BeginTx`，两条路都通）。
+- `ErrQueryTimeout` 应映射成 503，不要落入通用 500。。
 
 ### W4 —— 收尾
 

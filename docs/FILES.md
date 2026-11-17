@@ -75,6 +75,25 @@ PostgreSQL 的 `COPY` 协议不支持 `ON CONFLICT`，而 §8.4 同时要求「C
 
 **`Store` 结构与构造器为什么放在 `models.go`**：同样是为了不再增加文件数（没有独立的 `store.go`）。
 
+### `internal/profile` —— 地址画像查询
+
+| 文件 | 职责 | 阶段 |
+|---|---|---|
+| `balance.go` | `Profile` 类型与 `New`、`Querier` 窄接口（只声明 `BeginTx`）、`runReadOnly`（只读事务 + `statement_timeout` + `work_mem`）、`clampLimit`、`topic`（地址左填充 32 字节）、`u256Expr`（`data` 前 32 字节转 `numeric`）、`Holdings`。 | W3D2 |
+| `approval.go` | `Approvals`：`DISTINCT ON (contract, topic2)` 取区间内最新一条授权，`2^256-1` 标记 `IsUnlimited`。 | W3D2 |
+| `interaction.go` | `Interactions`：按合约汇总事件数与最近活动块，不按 `topic0` 过滤。 | W3D2 |
+| `profile_test.go` | 纯函数单测（limit 收敛、topic 填充、十进制解析、`2^256-1`）+ 受 `CHAINLENS_TEST_DSN` 门控的集成测试（默认 skip），后者含两条路径的净额对账。 | W3D2 |
+
+画像的三个方法都**只读本地 `chain_log`**，不查链（`docs/SESSION-HANDOFF.md` §5.1 第 4 条）。三条约定：
+
+1. **必须带过滤**：`LIMIT` 由 `clampLimit` 收敛到 200，`statement_timeout` 由数据库中断慢查询，超时翻译成 `ErrQueryTimeout` 供 API 层映射 503。
+2. **地址必须左填充**：`chain_log.topic1/topic2` 是 32 字节，用 20 字节地址查询会退化成全表扫描。
+3. **不建预计算表、缓存表或物化视图**：查询即计算。
+
+**`u256Expr` 为什么要拆成 8 段**：PostgreSQL 17 不支持 `bit(256)::numeric`，无法直接把 32 字节转数值。拆成 8 个 32 位分肢（每段必在 `bigint` 范围内）再乘 2 的幂，全程精确。该表达式已与 `decoded_event` 的十进制 `payload.value` 在 24 万条 Transfer 上逐条对账，零差异。
+
+**`Profile` 为什么只依赖窄接口而不是 `*pgxpool.Pool`**：§11 要求接口在使用方声明，`profile` 不 import `store`，也不绑死具体连接池实现。`*pgxpool.Pool` 恰好满足 `BeginTx`，直接传入即可。
+
 ### `internal/config`
 
 | 文件 | 职责 | 阶段 |
@@ -130,8 +149,6 @@ PostgreSQL 的 `COPY` 协议不支持 `ON CONFLICT`，而 §8.4 同时要求「C
 
 | 文件 | 里程碑 / 状态 |
 |---|---|
-| `internal/profile/balance.go`、`approval.go` | W3D2（地址画像：持仓聚合 / 授权解析）。**路径以 §5 为准，不要放进 `store`** |
-| `internal/profile/interaction.go` | W3D2，`§5` 未列，属新增偏离（见 `docs/SESSION-HANDOFF.md` §5.1 第 5 条） |
 | `internal/api/router.go`、`handlers.go`、`cmd/api/main.go` | W3D3（查询服务） |
 | `web/` | W4（前端） |
 | `cmd/redecode/main.go` | **用户明确暂缓**。用途：按区间删除 `decoded_event` 后回退游标重解，支持分批与断点。起因是切换 ABI 不会回溯重解，存量 3,978 条 `undecodable` 需要它才能安全修正。详见 `docs/SESSION-HANDOFF.md` §8。 |
