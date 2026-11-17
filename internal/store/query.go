@@ -1,0 +1,188 @@
+package store
+
+import (
+	"context"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/ethereum/go-ethereum/common"
+)
+
+// 本文件是 chain_log / decoded_event / index_cursor 的**只读**查询面，
+// 与写路径（logs.go / headers.go / decoded.go）分开：
+// 写路径服务于索引器的事务语义，读路径服务于查询服务，两者的事务要求不同。
+//
+// 只有一个文件而不是 events.go + stats.go：三个方法都是对同一批表的聚合，
+// 拆开会让「覆盖区间」这种被多处复用的查询无处安放。
+
+// EventQuery 是事件检索的过滤条件。字段为零值表示该维度不限。
+type EventQuery struct {
+	Contract  *common.Address
+	FromBlock *uint64
+	ToBlock   *uint64
+	Limit     int
+	Offset    int
+}
+
+// Event 是 chain_log 一行与解码结果的组合读模型。
+//
+// EventName / Status / Payload 在解码记录缺失时为零值，因此调用方应看 Status
+// 而不是假定 EventName 一定有值。
+type Event struct {
+	BlockNumber uint64
+	BlockTime   time.Time
+	TxHash      common.Hash
+	LogIndex    uint32
+	Contract    common.Address
+	EventName   string
+	Status      string
+	Payload     []byte
+}
+
+// Coverage 是当前已索引的区间与水位，用来给每个响应标注「这份数据覆盖到哪里」。
+//
+// 没有它，部分索引的数据会被读成「该地址没有历史」，这是本项目最容易出现的误读。
+type Coverage struct {
+	FromBlock       uint64
+	ToBlock         uint64
+	FinalizedBlock  uint64
+	NextBlock       uint64
+	LatestBlockTime time.Time
+}
+
+// Stats 是索引器的运行快照。
+type Stats struct {
+	Coverage
+	TotalLogs        int64
+	DecodedCount     int64
+	UndecodableCount int64
+}
+
+const listEventsBase = `
+SELECT l.block_number, l.block_time, l.tx_hash, l.log_index, l.contract,
+       coalesce(d.event_name, ''), coalesce(d.status, ''), coalesce(d.payload, '{}'::jsonb)
+FROM chain_log l
+LEFT JOIN decoded_event d ON d.tx_hash = l.tx_hash AND d.log_index = l.log_index`
+
+// ListEvents 按过滤条件检索事件，按区块与日志序号倒序返回。
+//
+// 条件按需拼接而不是写成 `($1 IS NULL OR ...)`：后者会让规划器无法使用
+// idx_log_block 的倒序扫描，本该提前停止的查询变成全表扫描。
+//
+// 排序与索引方向一致，配合 LIMIT 时规划器可以走索引倒序扫描、凑够条数即停；
+// 一旦指定 from/to，就会先按 block_number 位图定位再排序。OFFSET 深翻页会退化，
+// 这是已知取舍（游标分页留到需要时再做）。
+func (s *Store) ListEvents(ctx context.Context, q EventQuery) ([]Event, error) {
+	conditions := make([]string, 0, 3)
+	args := make([]any, 0, 5)
+
+	if q.Contract != nil {
+		args = append(args, q.Contract.Bytes())
+		conditions = append(conditions, fmt.Sprintf("l.contract = $%d", len(args)))
+	}
+	if q.FromBlock != nil {
+		args = append(args, int64(*q.FromBlock))
+		conditions = append(conditions, fmt.Sprintf("l.block_number >= $%d", len(args)))
+	}
+	if q.ToBlock != nil {
+		args = append(args, int64(*q.ToBlock))
+		conditions = append(conditions, fmt.Sprintf("l.block_number <= $%d", len(args)))
+	}
+
+	query := listEventsBase
+	if len(conditions) > 0 {
+		query += " WHERE " + strings.Join(conditions, " AND ")
+	}
+
+	args = append(args, q.Limit, q.Offset)
+	query += fmt.Sprintf(" ORDER BY l.block_number DESC, l.log_index DESC LIMIT $%d OFFSET $%d", len(args)-1, len(args))
+
+	rows, err := s.pool.Query(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("store: list events: %w", err)
+	}
+	defer rows.Close()
+
+	events := make([]Event, 0, q.Limit)
+	for rows.Next() {
+		var (
+			event   Event
+			txHash  []byte
+			payload []byte
+		)
+		if err := rows.Scan(
+			&event.BlockNumber, &event.BlockTime, &txHash, &event.LogIndex, &event.Contract,
+			&event.EventName, &event.Status, &payload,
+		); err != nil {
+			return nil, fmt.Errorf("store: scan event: %w", err)
+		}
+		event.TxHash = common.BytesToHash(txHash)
+		event.Payload = payload
+		events = append(events, event)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: list events: %w", err)
+	}
+
+	return events, nil
+}
+
+// coverageSQL 一次取回水位与区间边界。
+//
+// min/max 走 idx_log_block 的两端，是 O(1) 级别的索引查找，与表大小无关。
+const coverageSQL = `
+SELECT i.next_block, i.finalized_block,
+       coalesce((SELECT min(block_number) FROM chain_log), 0),
+       coalesce((SELECT max(block_number) FROM chain_log), 0),
+       (SELECT block_time FROM chain_log ORDER BY block_number DESC LIMIT 1)
+FROM index_cursor i
+WHERE i.id = 1`
+
+// Coverage 返回已索引区间。数据库为空时区间为 0，LatestBlockTime 为零值。
+func (s *Store) Coverage(ctx context.Context) (Coverage, error) {
+	var (
+		coverage Coverage
+		latest   *time.Time
+	)
+	err := s.pool.QueryRow(ctx, coverageSQL).Scan(
+		&coverage.NextBlock, &coverage.FinalizedBlock,
+		&coverage.FromBlock, &coverage.ToBlock, &latest,
+	)
+	if err != nil {
+		return Coverage{}, fmt.Errorf("store: load coverage: %w", err)
+	}
+	if latest != nil {
+		coverage.LatestBlockTime = *latest
+	}
+	return coverage, nil
+}
+
+// countSQL 统计日志与解码状态。
+//
+// 这是全表聚合，代价随表线性增长。当前量级（百万行以内）在几十毫秒，
+// 全量索引 USDC 后会退化成秒级；届时应改成计数表或物化视图，
+// 但那与「不预计算」的约束冲突，等真到那一步再权衡。
+const countSQL = `
+SELECT (SELECT count(*) FROM chain_log),
+       (SELECT count(*) FROM decoded_event WHERE status = 'decoded'),
+       (SELECT count(*) FROM decoded_event WHERE status = 'undecodable')`
+
+// Stats 返回索引水位与事件计数。
+func (s *Store) Stats(ctx context.Context) (Stats, error) {
+	var stats Stats
+
+	coverage, err := s.Coverage(ctx)
+	if err != nil {
+		return Stats{}, err
+	}
+	stats.Coverage = coverage
+
+	if err := s.pool.QueryRow(ctx, countSQL).Scan(
+		&stats.TotalLogs, &stats.DecodedCount, &stats.UndecodableCount,
+	); err != nil {
+		return Stats{}, fmt.Errorf("store: load stats: %w", err)
+	}
+
+	return stats, nil
+}
