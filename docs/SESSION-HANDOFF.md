@@ -21,7 +21,7 @@ W1（索引链路）、W2（代理识别 + 最终性 + reorg 回滚）、W3D1（
 |---|---|
 | 远程 | `https://github.com/dyyyyy-1/chainlens.git`（**Public**） |
 | 分支 | `main`，本地与远程同步 |
-| 提交数 | 38 个（本节数字会随提交变化，以 `git log --oneline \| wc -l` 为准） |
+| 提交数 | 以 `git log --oneline \| wc -l` 为准（硬编码必然过期，故不写死） |
 | 推送凭据 | 系统级 `credential.helper=manager` + Windows 凭据库已有 `github.com` 条目，**`git push` 无需交互** |
 
 推送偶发 `schannel: failed to receive handshake`。**这不是凭据问题**——同期 `curl https://github.com` 返回 200、`git ls-remote` 能通，是写方向的 TLS 抖动，直接重试即可。若持续失败，可试 `git -c http.sslBackend=openssl push`。
