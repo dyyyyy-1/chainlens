@@ -1,6 +1,9 @@
 # 会话交接文档
 
 > 目的：让一个全新的会话在读完本文件后能无缝接手。**先读这份，再读 `HANDOFF.md`（设计依据）与 `docs/FILES.md`（代码地图）。**
+>
+> **冲突处理规则**：本文件与 `HANDOFF.md` 不一致时，**以 `HANDOFF.md` 为准**，并必须把偏离登记到 §5.1。本文件只描述运行状态，不重新定义设计。
+>
 > 最后更新：2026-11-17
 
 ---
@@ -92,6 +95,22 @@ GOSUMDB=sum.golang.org GOPROXY=https://goproxy.cn,direct go mod tidy
 2. **接口在使用方声明**：`LogFetcher` / `HeaderFetcher` / `LogStore` / `EventDecoder` 定义在 `internal/indexer`，`ChainReader` 定义在 `internal/decoder`；`chain` 与 `store` 只提供具体类型，不反向依赖。
 3. **解码失败不中断入库**：`decoder.Decode` 不返回 error，失败记为 `undecodable` 状态入库（§8.3）。
 
+### 5.1 对 `HANDOFF.md` 的偏离登记
+
+**规则**：`HANDOFF.md` 是设计依据，原则上不改。凡是实现与它不一致的地方，必须在**这张表**里登记，写明原文、实际做法、原因、批准人。**没登记的偏离视为缺陷。**
+
+| # | HANDOFF 原文 | 实际做法 | 原因 | 批准 |
+|---|---|---|---|---|
+| 1 | §5 `internal/store/` 只有 `models.go` / `logs.go` / `cursor.go` | 另有 `headers.go`、`decoded.go`、`meta.go` | 块头、解码结果、合约元信息各有独立写入路径，塞进 `logs.go` 会混淆职责 | 用户确认 |
+| 2 | §6 `decoded_event` 无状态列 | 增加 `status text NOT NULL DEFAULT 'decoded' CHECK (status IN ('decoded','undecodable'))`（`migrations/0002`） | §8.3 要求标记 `undecodable`，原表无处安放 | 用户确认（方案 C） |
+| 3 | §2/§3 ABI 用 Etherscan API | 改用 Sourcify v2（无需 key） | 不接受代注册第三方账号；Sourcify 免 key 且实测可用 | 用户确认 |
+| 4 | **ADR-3 画像用 `eth_getLogs` 按 topic1/topic2 实时查 + 内存缓存 5 分钟** | **改查本地 `chain_log`（已有 `topic1`/`topic2` 索引）** | 免费端点 `eth_getLogs` 跨度上限：publicnode 约 8,000 块、drpc 10,000 块，画像只能覆盖约 33 小时，产品语义失效。本地库无跨度限制且无 RPC 成本，同时仍不违反 ADR-3 的本意（**不预计算**） | 用户确认（方案 B） |
+| 5 | §5 `internal/profile/` 只有 `balance.go` / `approval.go` | 计划增加 `interaction.go` | 交互、持仓、授权三类聚合口径不同，合并到两个文件会让语义混杂 | 待确认 |
+| 6 | §8.1 隐含索引未确认区 | W1 阶段只扫到 `head - confirmations`，`is_finalized` 恒为 true | 当时为缩小 W1 范围；**已在 W2D2 回归 §8.1**，此条已关闭 | — |
+| 7 | §7 `Decoder.Decode(log) (DecodedEvent, error)` | `decoder.Decode(log) Event`，**不返回 error**，失败用 `Status`/`Reason` 表达 | 返回 error 会诱导调用方中断整批，与 §8.3「解码失败不中断索引」直接冲突 | 本会话说明，未单独确认 |
+
+补充说明（第 4 条）：ADR-3 的原始理由是"为全量地址预计算持仓成本极高"。查本地库**不做预计算**、不建聚合表、不建缓存表，只有查询，因此与该理由不冲突。查询侧的硬约束是用户另行提出的："必须有过滤、禁止全量扫描"，落实为 `LIMIT` + `statement_timeout` + 地址左填充 32 字节。
+
 ---
 
 ## 6. 已踩过的坑（重点，别重复）
@@ -145,8 +164,9 @@ GOSUMDB=sum.golang.org GOPROXY=https://goproxy.cn,direct go mod tidy
 **已定的决策**（不要再翻案，除非用户主动提）：
 
 - 端点用 publicnode 免费档；需要归档时切 Alchemy（**但不接受代注册**，见 §9）。
-- ABI 来源用 Sourcify，不用 Etherscan。
-- 画像数据源用**本地 `chain_log`**（方案 B），不走实时 `eth_getLogs`。
+- ABI 来源用 Sourcify，不用 Etherscan（**偏离 §3，见 §5.1 第 3 条**）。
+- 画像数据源用**本地 `chain_log`**（方案 B），不走实时 `eth_getLogs`（**偏离 ADR-3，见 §5.1 第 4 条**）。
+- 画像代码放 `internal/profile/`，按 §5；不放 `store`。
 - 画像查询的用户硬约束：**必须有过滤、禁止全量扫描**。落实方式：`LIMIT`、连接级 `statement_timeout`、地址左填充、不建任何预计算表或缓存表。
 - 不加 `(topic1, topic0)` 复合索引（实测 252k 行索引够用，省磁盘）。
 
@@ -179,10 +199,14 @@ GOSUMDB=sum.golang.org GOPROXY=https://goproxy.cn,direct go mod tidy
 
 ### W3D2 —— 地址画像查询层（下一步）
 
-- 新增 `internal/store/profile.go`：
-  - `Holdings(ctx, addr, limit)` —— 按合约聚合 Transfer 净额
-  - `Approvals(ctx, addr, limit)` —— 按 `(contract, spender)` 取最新一条，标注无限额度 `2^256-1`
-  - `Interactions(ctx, addr, limit)` —— 最近交互的合约
+**包路径以 `HANDOFF.md` §5 为准：`internal/profile/`，不是 `internal/store/`。**
+
+- `internal/profile/balance.go`：`Holdings(ctx, addr, limit)` —— 按合约聚合 Transfer 净额
+- `internal/profile/approval.go`：`Approvals(ctx, addr, limit)` —— 按 `(contract, spender)` 取最新一条，标注无限额度 `2^256-1`
+- `internal/profile/interaction.go`：`Interactions(ctx, addr, limit)` —— 最近交互的合约
+  （§5 只列了 balance/approval 两个文件，第三个属**新增偏离**，理由：交互与持仓、授权的聚合口径不同，合并会让单文件承担三类语义）
+- 数据访问用「使用方声明接口」：profile 内部定义窄接口（只读 `Query`），由 `store` 或 `*pgxpool.Pool` 满足，**不直接依赖 `store` 包的具体类型**，避免 store 变成画像逻辑的堆场。
+- SQL 归 profile 所有：画像查询是跨表只读聚合（`chain_log` + `decoded_event`），且带业务规则（净额、去重、无限额度），放在 store 里会让 store 承担业务语义。
 - 全部走 `idx_log_topic1` / `idx_log_topic2`。已用 `EXPLAIN ANALYZE` 验证：252k 行、单地址 11,288 行命中，`Bitmap Index Scan`，13 ms。
 - 硬约束落实：`LIMIT`、`statement_timeout`、地址左填充 32 字节、无预计算表。
 

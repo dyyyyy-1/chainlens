@@ -130,7 +130,8 @@ PostgreSQL 的 `COPY` 协议不支持 `ON CONFLICT`，而 §8.4 同时要求「C
 
 | 文件 | 里程碑 / 状态 |
 |---|---|
-| `internal/profile/balance.go`、`approval.go` | W3D2（地址画像查询层） |
+| `internal/profile/balance.go`、`approval.go` | W3D2（地址画像：持仓聚合 / 授权解析）。**路径以 §5 为准，不要放进 `store`** |
+| `internal/profile/interaction.go` | W3D2，`§5` 未列，属新增偏离（见 `docs/SESSION-HANDOFF.md` §5.1 第 5 条） |
 | `internal/api/router.go`、`handlers.go`、`cmd/api/main.go` | W3D3（查询服务） |
 | `web/` | W4（前端） |
 | `cmd/redecode/main.go` | **用户明确暂缓**。用途：按区间删除 `decoded_event` 后回退游标重解，支持分批与断点。起因是切换 ABI 不会回溯重解，存量 3,978 条 `undecodable` 需要它才能安全修正。详见 `docs/SESSION-HANDOFF.md` §8。 |
