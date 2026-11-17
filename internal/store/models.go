@@ -52,6 +52,17 @@ func (s *Store) Begin(ctx context.Context) (pgx.Tx, error) {
 	return tx, nil
 }
 
+// Pool 返回底层连接池，供同进程内的只读查询组件复用。
+//
+// 存在的理由只有一个：`internal/profile` 需要连接池，而连接池必须由本进程
+// 唯一持有。若让 profile 自己建池，同一进程会出现两套连接上限，总连接数翻倍，
+// 且两边的超时、生命周期互不知情。
+//
+// 调用方不应通过它执行写操作——写路径都在 Store 上。
+func (s *Store) Pool() *pgxpool.Pool {
+	return s.pool
+}
+
 // LogRecord 是 chain_log 一行在内存中的形态。
 type LogRecord struct {
 	BlockNumber uint64
