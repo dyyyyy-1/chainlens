@@ -37,6 +37,8 @@
 | `abi_test.go` | 上述四种边界 + Transfer/Approval 正常路径的表驱动测试。 | W1D3 |
 | `proxy.go` | 代理识别。声明 `ChainReader` 接口（由 `internal/chain` 实现），按优先级探测四种模式：EIP-1967 实现槽 → EIP-1967 信标槽（`eth_call` 取实现） → ZeppelinOS 遗留槽 → EIP-1167 最小代理字节码。**USDC 属于第三种**，只做 EIP-1967 会漏判。 | W2D1 |
 | `proxy_test.go` | 用 `fakeReader` 覆盖四种代理 + EOA + 普通合约 + 信标调用失败，全部脱离网络。 | W2D1 |
+| `sourcify.go` | 从 Sourcify v2 拉取已验证合约的 ABI。**无需注册与 API key**，这是替代 Etherscan 的关键理由。未验证返回 `ErrNotVerified`，5xx 重试一次，4xx 直接失败。注意返回的 ABI 可能是代理合约自己的（只有 `AdminChanged`/`Upgraded`），必须按实现地址拉取。 | W3D1 |
+| `sourcify_test.go` | 用 `httptest` 覆盖正常返回、未验证、ABI 为 null、5xx 重试成功、持续 5xx 放弃，全部离线。 | W3D1 |
 
 **为什么 `Decode` 不返回 `error`**：解码失败是预期内情况，未解码的日志同样要入库（`status = undecodable`）。返回 error 会诱导调用方中断整批，与 §8.3「不中断索引」冲突。失败原因放在 `Event.Reason`，只用于日志分级。
 

@@ -115,14 +115,23 @@ from=26422714 to=26424713 logs_fetched=139701 logs_inserted=0 decoded_inserted=0
 
 ## 6. 解码覆盖率
 
-| 指标 | 数值 |
-|---|---:|
-| 已解码 | 140,238 |
-| 未解码（`undecodable`） | 2,361 |
-| 未解码占比 | 1.67% |
+| 指标 | 内置 ABI | Sourcify ABI |
+|---|---:|---:|
+| 已解码 | 140,238 | 16,018 |
+| 未解码（`undecodable`） | 2,361（1.67%） | **0** |
 
-未解码全部是 USDC 自有事件（`FeeRecipientChanged`、`MinterConfigured` 等），
-不在内置 ERC20 ABI 内。W3 接入 Etherscan ABI 后可解。
+两列来自不同区间，只作量级对照。决定性证据是同一段区间 `26426000..26426199` 的重扫对比：
+
+| 阶段 | decoded | undecodable |
+|---|---:|---:|
+| 内置 ERC20 ABI | 15,781 | 237 |
+| Sourcify 拉到实现合约 ABI | 16,018 | **0** |
+
+237 条未解码全部是 USDC 自有事件，接上实现 ABI 后归零。事件分布：
+`Transfer` 14,555、`Approval` 1,226、`Mint` 111、`Burn` 96、`AuthorizationUsed` 30。
+
+注意：切 ABI 不会回溯重解已有数据。存量 `decoded_event` 仍是内置 ABI 的结果，
+需要重解时按区间删除后回退游标重扫（本次验证即此做法）。
 
 ## 7. 本次压测修正的缺陷
 
