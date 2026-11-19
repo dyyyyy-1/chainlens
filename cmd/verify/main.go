@@ -95,7 +95,11 @@ func run() int {
 	}
 	defer st.Close()
 
-	client, err := chain.New(ctx, cfg.RPCHTTPURL, cfg.ChainID, chain.Options{})
+	client, err := chain.New(ctx, cfg.RPCHTTPURL, cfg.ChainID, chain.Options{
+		// 与索引器读同一个配置：用 drpc 核对补缺口那段数据时，
+		// 块头批量必须降到 3，否则对拍工具自己会先失败。
+		HeaderBatchSize: int(cfg.RPCHeaderBatch),
+	})
 	if err != nil {
 		slog.Error("verify failed", "stage", "rpc", "err", err)
 		return 2
