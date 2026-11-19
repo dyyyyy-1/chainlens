@@ -26,6 +26,8 @@ type fakeEvents struct {
 	eventsErr error
 	statsErr  error
 	lastQuery store.EventQuery
+	// statsCalls 供缓存测试断言底层被调用的次数。
+	statsCalls int
 }
 
 func (f *fakeEvents) ListEvents(_ context.Context, q store.EventQuery) ([]store.Event, error) {
@@ -34,6 +36,7 @@ func (f *fakeEvents) ListEvents(_ context.Context, q store.EventQuery) ([]store.
 }
 
 func (f *fakeEvents) Stats(context.Context) (store.Stats, error) {
+	f.statsCalls++
 	return f.stats, f.statsErr
 }
 

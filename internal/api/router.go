@@ -52,6 +52,10 @@ type Deps struct {
 // 五条静态路由。HANDOFF.md 第 5 节写的是 chi，这里没有引入：为一个 router
 // 增加一条直接依赖不划算，差异已登记在 docs/SESSION-HANDOFF.md §5.1。
 func NewRouter(d Deps) http.Handler {
+	// 先包缓存，再注册 handler：handler 是绑定在 d 上的方法值，
+	// 注册之后再改 d 不会影响已绑定的方法接收者。
+	d = d.withCachedStats()
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/events", d.handleEvents)
 	mux.HandleFunc("GET /api/address/{addr}/balances", d.handleBalances)
@@ -60,6 +64,12 @@ func NewRouter(d Deps) http.Handler {
 	mux.HandleFunc("GET /api/stats", d.handleStats)
 
 	return d.observe(rateLimited(newRateLimiter(d.RateLimitPerMinute), mux))
+}
+
+// withCachedStats 返回一个把 /api/stats 计数缓存起来的 Deps。
+func (d Deps) withCachedStats() Deps {
+	d.Events = withStatsCache(d.Events, statsCacheTTL)
+	return d
 }
 
 // observe 统一处理请求超时、panic 恢复与访问日志。
