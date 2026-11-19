@@ -306,3 +306,129 @@ func TestMethodNotAllowed(t *testing.T) {
 		t.Fatalf("状态码 = %d, want 405", recorder.Code)
 	}
 }
+
+func TestEventsCursorPagination(t *testing.T) {
+	// 返回条数等于 limit 才能判断「可能还有下一页」，因此造满一页。
+	events := &fakeEvents{coverage: testCoverage()}
+	for i := range 2 {
+		events.events = append(events.events, store.Event{
+			BlockNumber: 26433029,
+			BlockTime:   time.Date(2026, 11, 17, 6, 29, 47, 0, time.UTC),
+			TxHash:      common.Hash{31: byte(i + 1)},
+			LogIndex:    uint32(588 - i),
+			Contract:    common.HexToAddress("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
+			EventName:   "Transfer",
+			Status:      "decoded",
+			Payload:     []byte(`{}`),
+		})
+	}
+	handler := newTestRouter(events, &fakeProfile{})
+
+	recorder := get(t, handler, "/api/events?limit=2")
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("状态码 = %d, body=%s", recorder.Code, recorder.Body.String())
+	}
+
+	body := decodeBody[struct {
+		NextCursor string `json:"next_cursor"`
+	}](t, recorder)
+	if body.NextCursor != "26433029:587" {
+		t.Fatalf("next_cursor = %q, want 26433029:587（最后一行的 block:index）", body.NextCursor)
+	}
+}
+
+func TestEventsNoCursorOnLastPage(t *testing.T) {
+	// 只返回 1 条而 limit=2，说明到底了，不应再给游标。
+	events := &fakeEvents{
+		coverage: testCoverage(),
+		events:   []store.Event{{BlockNumber: 26433029, LogIndex: 588, Payload: []byte(`{}`)}},
+	}
+	handler := newTestRouter(events, &fakeProfile{})
+
+	body := decodeBody[struct {
+		NextCursor string `json:"next_cursor"`
+	}](t, get(t, handler, "/api/events?limit=2"))
+	if body.NextCursor != "" {
+		t.Fatalf("最后一页不应给 next_cursor，得到 %q", body.NextCursor)
+	}
+}
+
+func TestEventsCursorIsPropagated(t *testing.T) {
+	events := &fakeEvents{coverage: testCoverage()}
+	handler := newTestRouter(events, &fakeProfile{})
+
+	recorder := get(t, handler, "/api/events?cursor=26433029:588&limit=10")
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("状态码 = %d, body=%s", recorder.Code, recorder.Body.String())
+	}
+	if events.lastQuery.Cursor == nil {
+		t.Fatal("cursor 未透传到查询")
+	}
+	if events.lastQuery.Cursor.BlockNumber != 26433029 || events.lastQuery.Cursor.LogIndex != 588 {
+		t.Fatalf("cursor = %+v", events.lastQuery.Cursor)
+	}
+	if events.lastQuery.Offset != 0 {
+		t.Fatalf("使用游标时 offset 必须为 0，得到 %d", events.lastQuery.Offset)
+	}
+}
+
+func TestInvalidCursor(t *testing.T) {
+	handler := newTestRouter(&fakeEvents{}, &fakeProfile{})
+
+	for _, raw := range []string{"abc", "26433029", "26433029:abc", ":5"} {
+		recorder := get(t, handler, "/api/events?cursor="+raw)
+		if recorder.Code != http.StatusBadRequest {
+			t.Fatalf("cursor=%q 状态码 = %d, want 400", raw, recorder.Code)
+		}
+		if code := decodeBody[errorResponseDTO](t, recorder).Error.Code; code != "invalid_cursor" {
+			t.Fatalf("cursor=%q 错误码 = %q, want invalid_cursor", raw, code)
+		}
+	}
+}
+
+func TestCursorAndOffsetConflict(t *testing.T) {
+	handler := newTestRouter(&fakeEvents{}, &fakeProfile{})
+
+	recorder := get(t, handler, "/api/events?cursor=26433029:588&offset=10")
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("状态码 = %d, want 400", recorder.Code)
+	}
+	if code := decodeBody[errorResponseDTO](t, recorder).Error.Code; code != "conflicting_pagination" {
+		t.Fatalf("错误码 = %q, want conflicting_pagination", code)
+	}
+}
+
+func TestRateLimit(t *testing.T) {
+	handler := NewRouter(Deps{
+		Events:             &fakeEvents{coverage: testCoverage()},
+		Profile:            &fakeProfile{},
+		RateLimitPerMinute: 2,
+	})
+
+	for i := range 2 {
+		if code := get(t, handler, "/api/stats").Code; code != http.StatusOK {
+			t.Fatalf("第 %d 次请求状态码 = %d, want 200", i+1, code)
+		}
+	}
+
+	recorder := get(t, handler, "/api/stats")
+	if recorder.Code != http.StatusTooManyRequests {
+		t.Fatalf("超限后状态码 = %d, want 429", recorder.Code)
+	}
+	if recorder.Header().Get("Retry-After") == "" {
+		t.Fatal("429 响应必须带 Retry-After")
+	}
+	if code := decodeBody[errorResponseDTO](t, recorder).Error.Code; code != "rate_limited" {
+		t.Fatalf("错误码 = %q, want rate_limited", code)
+	}
+}
+
+func TestRateLimitDisabled(t *testing.T) {
+	handler := NewRouter(Deps{Events: &fakeEvents{coverage: testCoverage()}, Profile: &fakeProfile{}})
+
+	for i := range 5 {
+		if code := get(t, handler, "/api/stats").Code; code != http.StatusOK {
+			t.Fatalf("未配置限流时第 %d 次请求被拒：%d", i+1, code)
+		}
+	}
+}

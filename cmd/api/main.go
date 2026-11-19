@@ -69,9 +69,10 @@ func run() error {
 	defer st.Close()
 
 	handler := api.NewRouter(api.Deps{
-		Events:  st,
-		Profile: profile.New(st.Pool()),
-		Logger:  slog.Default(),
+		Events:             st,
+		Profile:            profile.New(st.Pool()),
+		Logger:             slog.Default(),
+		RateLimitPerMinute: int(cfg.HTTPRateLimit),
 	})
 
 	server := &http.Server{

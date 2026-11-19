@@ -42,6 +42,8 @@ type Deps struct {
 	Events  EventStore
 	Profile ProfileReader
 	Logger  *slog.Logger
+	// RateLimitPerMinute 是每个来源 IP 每分钟允许的请求数；<=0 表示不限流。
+	RateLimitPerMinute int
 }
 
 // NewRouter 组装路由与中间件。
@@ -57,7 +59,7 @@ func NewRouter(d Deps) http.Handler {
 	mux.HandleFunc("GET /api/address/{addr}/interactions", d.handleInteractions)
 	mux.HandleFunc("GET /api/stats", d.handleStats)
 
-	return d.observe(mux)
+	return d.observe(rateLimited(newRateLimiter(d.RateLimitPerMinute), mux))
 }
 
 // observe 统一处理请求超时、panic 恢复与访问日志。

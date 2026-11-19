@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -31,6 +32,15 @@ const (
 type responseDTO struct {
 	Coverage coverageDTO `json:"coverage"`
 	Data     any         `json:"data"`
+}
+
+// eventsResponseDTO 多带一个 next_cursor。
+//
+// 游标只在「这一页填满了」时给出：返回不足 limit 说明已经到底，客户端不该再请求。
+type eventsResponseDTO struct {
+	Coverage   coverageDTO `json:"coverage"`
+	Data       any         `json:"data"`
+	NextCursor string      `json:"next_cursor,omitempty"`
 }
 
 type coverageDTO struct {
@@ -117,7 +127,20 @@ func (d Deps) handleEvents(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	d.writeData(w, r, items)
+	coverage, err := d.Events.Coverage(r.Context())
+	if err != nil {
+		d.fail(w, r, err)
+		return
+	}
+
+	body := eventsResponseDTO{Coverage: toCoverageDTO(coverage), Data: items}
+	// 只有填满一页才给下一页游标：不足 limit 说明确实到底了。
+	if query.Limit > 0 && len(events) == query.Limit {
+		last := events[len(events)-1]
+		body.NextCursor = fmt.Sprintf("%d:%d", last.BlockNumber, last.LogIndex)
+	}
+
+	writeJSON(w, http.StatusOK, body)
 }
 
 func (d Deps) handleBalances(w http.ResponseWriter, r *http.Request) {
@@ -268,8 +291,24 @@ func parseEventQuery(w http.ResponseWriter, r *http.Request) (store.EventQuery, 
 	}
 	query.Limit = limit
 
-	if raw := values.Get("offset"); raw != "" {
-		offset, err := strconv.Atoi(raw)
+	// 游标与 offset 互斥：同时给出说明调用方没想清楚要哪种翻页语义，
+	// 静默取其一会让分页在客户端悄悄错位。
+	cursorRaw := values.Get("cursor")
+	offsetRaw := values.Get("offset")
+
+	switch {
+	case cursorRaw != "" && offsetRaw != "":
+		writeError(w, http.StatusBadRequest, "conflicting_pagination",
+			"cursor and offset are mutually exclusive")
+		return store.EventQuery{}, false
+	case cursorRaw != "":
+		cursor, ok := parseCursor(w, cursorRaw)
+		if !ok {
+			return store.EventQuery{}, false
+		}
+		query.Cursor = cursor
+	case offsetRaw != "":
+		offset, err := strconv.Atoi(offsetRaw)
 		if err != nil || offset < 0 {
 			writeError(w, http.StatusBadRequest, "invalid_offset", "offset must be a non-negative integer")
 			return store.EventQuery{}, false
@@ -278,6 +317,28 @@ func parseEventQuery(w http.ResponseWriter, r *http.Request) (store.EventQuery, 
 	}
 
 	return query, true
+}
+
+// parseCursor 解析 "<block>:<log_index>" 形式的键集游标。
+func parseCursor(w http.ResponseWriter, raw string) (*store.EventCursor, bool) {
+	blockPart, indexPart, found := strings.Cut(raw, ":")
+	if !found {
+		writeError(w, http.StatusBadRequest, "invalid_cursor", `cursor must look like "<block>:<log_index>"`)
+		return nil, false
+	}
+
+	block, err := strconv.ParseUint(blockPart, 10, 64)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_cursor", `cursor must look like "<block>:<log_index>"`)
+		return nil, false
+	}
+	index, err := strconv.ParseUint(indexPart, 10, 32)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_cursor", `cursor must look like "<block>:<log_index>"`)
+		return nil, false
+	}
+
+	return &store.EventCursor{BlockNumber: block, LogIndex: uint32(index)}, true
 }
 
 // parseUintParam 把可选的十进制参数解析成 uint64，空串返回 nil。
@@ -336,15 +397,19 @@ func (d Deps) writeData(w http.ResponseWriter, r *http.Request, data any) {
 
 func writeResponse(w http.ResponseWriter, coverage store.Coverage, data any) {
 	writeJSON(w, http.StatusOK, responseDTO{
-		Coverage: coverageDTO{
-			FromBlock:       coverage.FromBlock,
-			ToBlock:         coverage.ToBlock,
-			FinalizedBlock:  coverage.FinalizedBlock,
-			NextBlock:       coverage.NextBlock,
-			LatestBlockTime: formatTime(coverage.LatestBlockTime),
-		},
-		Data: data,
+		Coverage: toCoverageDTO(coverage),
+		Data:     data,
 	})
+}
+
+func toCoverageDTO(coverage store.Coverage) coverageDTO {
+	return coverageDTO{
+		FromBlock:       coverage.FromBlock,
+		ToBlock:         coverage.ToBlock,
+		FinalizedBlock:  coverage.FinalizedBlock,
+		NextBlock:       coverage.NextBlock,
+		LatestBlockTime: formatTime(coverage.LatestBlockTime),
+	}
 }
 
 // fail 把内部错误映射成 HTTP 状态码。

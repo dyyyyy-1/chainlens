@@ -21,8 +21,20 @@ type EventQuery struct {
 	Contract  *common.Address
 	FromBlock *uint64
 	ToBlock   *uint64
-	Limit     int
-	Offset    int
+	// Cursor 是上一页最后一行，走键集分页；为空表示从最新开始。
+	// 与 Offset 互斥，Cursor 优先。
+	Cursor *EventCursor
+	Limit  int
+	Offset int
+}
+
+// EventCursor 是键集分页的游标，对应 chain_log 排序键 (block_number, log_index)。
+//
+// 用键集而不是 OFFSET：OFFSET 让数据库先数过前面所有行，翻到第 1 万页时
+// 前 1 万页的行都要被扫出来。键集的代价恒定，且不会因并发写入而跳行。
+type EventCursor struct {
+	BlockNumber uint64
+	LogIndex    uint32
 }
 
 // Event 是 chain_log 一行与解码结果的组合读模型。
@@ -89,14 +101,26 @@ func (s *Store) ListEvents(ctx context.Context, q EventQuery) ([]Event, error) {
 		args = append(args, int64(*q.ToBlock))
 		conditions = append(conditions, fmt.Sprintf("l.block_number <= $%d", len(args)))
 	}
+	if q.Cursor != nil {
+		// 行比较 (block_number, log_index) < (cursor)：与倒序排序键同向，
+		// 规划器可以从游标位置继续沿索引倒序扫描，不需要回退。
+		args = append(args, int64(q.Cursor.BlockNumber), int32(q.Cursor.LogIndex))
+		conditions = append(conditions, fmt.Sprintf("(l.block_number, l.log_index) < ($%d, $%d)", len(args)-1, len(args)))
+	}
 
 	query := listEventsBase
 	if len(conditions) > 0 {
 		query += " WHERE " + strings.Join(conditions, " AND ")
 	}
 
-	args = append(args, q.Limit, q.Offset)
-	query += fmt.Sprintf(" ORDER BY l.block_number DESC, l.log_index DESC LIMIT $%d OFFSET $%d", len(args)-1, len(args))
+	order := " ORDER BY l.block_number DESC, l.log_index DESC"
+	if q.Cursor != nil {
+		args = append(args, q.Limit)
+		query += order + fmt.Sprintf(" LIMIT $%d", len(args))
+	} else {
+		args = append(args, q.Limit, q.Offset)
+		query += order + fmt.Sprintf(" LIMIT $%d OFFSET $%d", len(args)-1, len(args))
+	}
 
 	rows, err := s.pool.Query(ctx, query, args...)
 	if err != nil {
