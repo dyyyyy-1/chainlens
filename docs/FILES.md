@@ -70,7 +70,7 @@
 | `decoded.go` | `InsertDecoded`：`unnest` 写入解码结果，`payload` 以 JSON 文本传入后在库内转 `jsonb`。 | W1D3 |
 | `meta.go` | `UpsertContractMeta` / `LoadContractMeta`：代理识别结果的读写。`abi` 用 `COALESCE` 更新，避免重复解析时把已获取的 ABI 覆盖成空。 | W2D1 |
 | `cursor.go` | `EnsureCursor` / `LoadCursor` / `Advance`。游标推进必须由调用方传入事务。 | W1D2 |
-| `query.go` | 只读查询面：`ListEvents`（按合约/区间过滤，条件按需拼接）、`Coverage`（已索引区间）、`Stats`（水位 + 事件计数）、`LogsByRange`（区间原始日志，供 `cmd/verify` 对拍与导出）。与写路径分开：写路径服务于索引器的事务语义，读路径服务于查询服务。 | W3D3、W4 |
+| `query.go` | 只读查询面：`ListEvents`（按合约/区间过滤，支持键集游标，条件按需拼接）、`Coverage`（已索引区间）、`Stats`（水位 + 事件计数）、`LogsByRange`（区间原始日志，供 `cmd/verify` 对拍与导出）。与写路径分开：写路径服务于索引器的事务语义，读路径服务于查询服务。 | W3D3、W4 |
 
 **`logs.go` 为什么这么绕（临时表 → COPY → INSERT ... ON CONFLICT）**：
 PostgreSQL 的 `COPY` 协议不支持 `ON CONFLICT`，而 §8.4 同时要求「COPY 批量写」与「冲突时静默跳过」。解法是事务内建 `TEMP TABLE ... (LIKE chain_log) ON COMMIT DROP`（`LIKE` 默认不带主键约束，灌入不会因重复中断），COPY 进临时表后再用 `INSERT ... SELECT ... ON CONFLICT (tx_hash, log_index) DO NOTHING` 合并。返回值是 `RowsAffected()`，即**实际新增行数**——重扫时恒为 0，这就是幂等的判定依据。
@@ -104,8 +104,10 @@ PostgreSQL 的 `COPY` 协议不支持 `ON CONFLICT`，而 §8.4 同时要求「C
 
 | 文件 | 职责 | 阶段 |
 |---|---|---|
-| `router.go` | 路由（5 个端点）、`EventStore` / `ProfileReader` 两个窄接口、请求中间件（超时预算、panic 恢复、访问日志、状态码记录）。 | W3D3 |
-| `handlers.go` | 参数解析与校验、错误映射（超时 → 503、内部错误 → 500 且不泄露 SQL）、响应 DTO 与 `coverage` 封装、hex 与时间格式化。 | W3D3 |
+| `router.go` | 路由（5 个端点）、`EventStore` / `ProfileReader` 两个窄接口、请求中间件（超时预算、panic 恢复、访问日志、状态码记录）、按 IP 限流的接线。 | W3D3、加固 |
+| `handlers.go` | 参数解析与校验（含键集游标）、错误映射（超时 → 503、内部错误 → 500 且不泄露 SQL）、响应 DTO 与 `coverage` 封装、hex 与时间格式化。 | W3D3、加固 |
+| `stats_cache.go` | 给 `/api/stats` 的计数加 10 秒进程内缓存（只包 `Stats`，不包事件检索与覆盖区间）。持有互斥锁完成查询，顺带做单飞，避免并发打进来时多个请求同时做全表聚合。错误不进缓存。 | 加固 |
+| `ratelimit.go` | 按来源 IP 的固定窗口限流，缺省 120 次/分钟，`0` 关闭。限流表设容量上限并清理过期条目。**刻意不读 `X-Forwarded-For`**：本服务没有可信代理，该头可被伪造。 | 加固 |
 | `handlers_test.go` | 全离线的假实现测试：路由匹配、地址/区间/limit 校验、超时映射、错误不泄露内部细节、大写地址统一转小写、`2^256-1` 精确输出。 | W3D3 |
 
 **为什么用标准库 `ServeMux` 而不是 chi**：`HANDOFF.md` 第 5 节写的是 chi，但 Go 1.22+ 的 `ServeMux` 已支持 `GET /api/address/{addr}/balances` 这种「方法 + 路径参数」模式，本服务五条静态路由完全覆盖。为一个 router 增加一条直接依赖不划算，差异已登记在 `docs/SESSION-HANDOFF.md` §5.1。

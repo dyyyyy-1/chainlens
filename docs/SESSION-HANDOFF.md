@@ -78,22 +78,23 @@ GOSUMDB=sum.golang.org GOPROXY=https://goproxy.cn,direct go mod tidy
 | W3D2 | 地址画像查询层（`Holdings` / `Approvals` / `Interactions`），`internal/profile` | ✅ 完成 |
 | W3D3 | HTTP API（5 个端点）+ `cmd/api` | ✅ 完成 |
 | W4 | 回放对拍（`cmd/verify`）、README、BENCHMARK 重测 | ✅ 完成 |
+| 加固 | 事件键集分页、按 IP 限流、stats 计数缓存 | ✅ 完成 |
 | W4+ | 前端 `web/`（`HANDOFF` §9 标为可选） | ⬜ **未开始，待决定** |
 
 ---
 
 ## 4. 当前数据状态
 
-`chainlens` 库快照（2026-11-17 14:50，索引器**已停机**，数字稳定）：
+`chainlens` 库快照（2026-11-19 13:55，索引器**运行中**）：
 
 | 指标 | 值 |
 |---|---|
-| `chain_log` 行数 | 848,735 |
-| 已索引区间 | 26422714 .. 26433029 |
-| `chain_log` 总大小 | 318 MB |
-| `decoded_event` | decoded 844,757 / undecodable 3,978 |
-| `index_cursor` | `next_block=26433030`，`finalized_block=26433017`，`chain_id=1` |
-| `block_header` | 10,316 行，其中 `is_finalized=false` 12 行（确认数窗口） |
+| `chain_log` 行数 | 2,102,518 |
+| 已索引区间 | 26422714 .. 26447172（连续，无缺口） |
+| `chain_log` 总大小 | 773 MB |
+| `decoded_event` | decoded 2,098,540 / undecodable 3,978（存量） |
+| `index_cursor` | `next_block=26447173`，`finalized_block=26447160`，`chain_id=1` |
+| `block_header` | 24,459 行 = 区间块数（连续），其中 `is_finalized=false` 12 行 |
 | `contract_meta` | USDC，`abi_source=sourcify`，72 条目，implementation `0x4350...02dd` |
 | 事件分布 | Transfer 约占 90%，其余为 Approval / Mint / Burn / AuthorizationUsed / unknown 3,978 |
 
@@ -132,6 +133,8 @@ GOSUMDB=sum.golang.org GOPROXY=https://goproxy.cn,direct go mod tidy
 | 9 | §5 查询服务路由用 **chi** | 用标准库 `ServeMux`（Go 1.22+ 的「方法 + 路径参数」模式） | 本服务只有五条静态路由，`ServeMux` 完全覆盖；为一个 router 增加一条直接依赖不划算，`go.mod` 仍保持两个直接依赖 | 用户授权本次自行决定 |
 | 10 | §7 `GET /api/stats` 含「追平延迟」 | 给 `stale_seconds`（最新区块时间与当前时刻之差），不给「落后多少块」 | 块级落后必须接 RPC 查链头，会让只读服务多一个外部依赖与一种失败模式；时间差同样能判断数据新鲜度 | 用户授权本次自行决定 |
 | 11 | §5 进程入口只有 `cmd/indexer`（W3D3 已增 `cmd/api`） | 再加 `cmd/verify`（回放对拍） | 对拍是 W4 的验收手段，需要独立进程与退出码；写成 shell 脚本就无法复用 `chain` 的重试语义与 `store` 的类型 | 用户确认（W4 范围选定「对拍 + README」） |
+| 12 | §7 `GET /api/events` 只有 `offset` | 增加 `cursor`（键集分页），`offset` 保留兼容；两者互斥，同时给出报 400 | `OFFSET` 让数据库先数过前面所有行，翻得越深越慢；静默取其一会让客户端分页悄悄错位 | 用户确认（先做加固） |
+| 13 | 加固方案原定「stats 计数表」 | 改为 **10 秒进程内 TTL 缓存** | 计数表要在「批提交事务」与「reorg 回滚」两处同时维护，任何一处漏改都会让统计静默漂移且难以发现；缓存的失效方式是过期，不会积累错误 | 用户确认（改选 TTL 缓存） |
 
 补充说明（第 4 条）：ADR-3 的原始理由是"为全量地址预计算持仓成本极高"。查本地库**不做预计算**、不建聚合表、不建缓存表，只有查询，因此与该理由不冲突。查询侧的硬约束是用户另行提出的："必须有过滤、禁止全量扫描"，落实为 `LIMIT` + `statement_timeout` + 地址左填充 32 字节。
 
@@ -310,7 +313,27 @@ W4 之前需要知道的限制：
 **仍未做**：
 
 - 前端 `web/`（`HANDOFF` §9 标为可选，等用户定）。
-- 可选加固：限流、鉴权、`/api/events` 的游标分页、`/api/stats` 的计数表。
+- 鉴权（有限流，但限流不是鉴权）。
+
+### 加固（✅ 完成 2026-11-19）
+
+- **键集分页**：`/api/events` 支持 `cursor=<block>:<log_index>`，走行比较 `(block_number, log_index) < (...)`，与倒序排序键同向。`offset` 保留兼容，两者互斥（同时给出报 400）。只在填满一页时返回 `next_cursor`。
+- **按 IP 限流**：固定窗口，缺省 120 次/分钟（`HTTP_RATE_LIMIT`，`0` 关闭）。**不读 `X-Forwarded-For`**：没有可信代理，该头可被任意伪造。
+- **stats 缓存**：10 秒进程内 TTL，只包 `Stats`，错误不进缓存。放弃计数表的理由见 §5.1 第 13 条。
+
+测试：`internal/api` 20 个用例，其中缓存覆盖「命中 / 恰好过期 / 错误不缓存 / ttl=0 关闭」四种边界。
+
+### 缺口补齐（2026-11-19）
+
+停机两天，`next_block` 落后链头 13,854 块，远超 publicnode 的 head−9,999 窗口，**直接重启必然第一批就报归档错误**。做法：
+
+1. 把块头批量做成可配置（`RPC_HEADER_BATCH`）——drpc 免费档只允许 3，写死 100 会直接失败。
+2. 用 drpc（归档可查）从游标处往上补：`RPC_HTTP_URL=https://eth.drpc.org`、`BATCH_BLOCK_RANGE=100`、`RPC_HEADER_BATCH=3`。
+3. 补到 publicnode 窗口内（约 head−9,000，留 1,000 块余量抵消补的过程里窗口上移）后切回 publicnode。
+
+**drpc 的 `eth_getLogs` 跨度上限实测是 100 块**，不是此前文档写的 10,000——这才是批量必须降到 100 的原因。速度约 2.5 块/秒（每 100 块要 34 次块头批量），4,870 块约 32 分钟。
+
+教训：**免费端点的时间窗口决定了「停机超过一天就等于断档」**。想保持连续历史，索引器要么常驻，要么每次停机后都走一次这套补缺口流程。
 
 ---
 

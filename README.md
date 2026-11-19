@@ -53,8 +53,10 @@ curl -s "localhost:8080/api/address/0x000000000004444c5dc75cb358380d2e3de08a90/b
 | `TARGET_CONTRACT` | 必填，被索引的合约 |
 | `START_BLOCK` | 起始区块 |
 | `CONFIRMATIONS` | 最终性窗口，默认 12 |
-| `BATCH_BLOCK_RANGE` | 单批区块数，默认 2000 |
+| `BATCH_BLOCK_RANGE` | 单批区块数，默认 2000。换端点补历史时要按端点上限调小 |
+| `RPC_HEADER_BATCH` | 单次批量请求的块头数，默认 100。publicnode 允许 100，drpc 免费档只允许 3 |
 | `HTTP_ADDR` | 查询服务监听地址，默认 `:8080` |
+| `HTTP_RATE_LIMIT` | 每 IP 每分钟请求上限，默认 120；0 关闭 |
 
 ---
 
@@ -129,15 +131,15 @@ curl -s "localhost:8080/api/address/0x000000000004444c5dc75cb358380d2e3de08a90/b
 | 存储 | 38.3 万条日志 → `chain_log` 147 MB + `decoded_event` 113 MB（约 680 B/条） |
 | 新数据未解码率 | 0%（Sourcify ABI） |
 
-查询延迟（库内 84.9 万条日志）：
+查询延迟（库内 210 万条日志、24,459 块，最热地址 5.7 万条 Transfer）：
 
 | 端点 | 耗时 |
 |---|---|
-| `/api/events` | 2 ms |
-| `/api/address/{a}/approvals` | 12 ms |
-| `/api/address/{a}/interactions` | 102 ms |
-| `/api/stats` | 176 ms |
-| `/api/address/{a}/balances` | 214 ms |
+| `/api/events?limit=50` | 3 ms |
+| `/api/address/{a}/approvals` | 156 ms |
+| `/api/address/{a}/interactions` | 154 ms |
+| `/api/address/{a}/balances` | 296 ms |
+| `/api/stats` | 353 ms（首次）/ <1 ms（10 秒缓存内） |
 
 比对记录与完整基准见 [`docs/BENCHMARK.md`](docs/BENCHMARK.md)。
 
@@ -171,7 +173,8 @@ curl -s "localhost:8080/api/address/0x000000000004444c5dc75cb358380d2e3de08a90/b
 
 ### `GET /api/events`
 
-参数：`contract`（地址）、`from` / `to`（区块区间）、`limit`（默认 50，上限 200）、`offset`。
+参数：`contract`（地址）、`from` / `to`（区块区间）、`limit`（默认 50，上限 200）、
+翻页二选一——`cursor`（推荐）或 `offset`（兼容旧调用，深翻页会退化）。
 
 ```json
 {
@@ -185,9 +188,16 @@ curl -s "localhost:8080/api/address/0x000000000004444c5dc75cb358380d2e3de08a90/b
     "event": "Transfer",
     "status": "decoded",
     "payload": {"from": "0x8f0d...", "to": "0x82b2...", "value": "1000000000"}
-  }]
+  }],
+  "next_cursor": "26433029:588"
 }
 ```
+
+翻页用键集（keyset）而不是 `OFFSET`：`OFFSET` 让数据库先数过前面所有行，翻到很深时
+前面每一行都要被扫出来；键集从上一页最后一行继续沿索引倒序扫描，代价恒定，也不会
+因为并发写入而跳行。`next_cursor` 只在**本页填满**时返回——不足 `limit` 说明已经到底。
+
+`cursor` 与 `offset` 互斥，同时给出会返回 400，避免两种翻页语义在客户端悄悄错位。
 
 ### `GET /api/address/{addr}/balances`
 
@@ -221,21 +231,26 @@ curl -s "localhost:8080/api/address/0x000000000004444c5dc75cb358380d2e3de08a90/b
 
 | 状态 | `code` | 含义 |
 |---|---|---|
-| 400 | `invalid_address` / `invalid_contract` / `invalid_range` / `invalid_limit` / `invalid_offset` | 参数不合法 |
+| 400 | `invalid_address` / `invalid_contract` / `invalid_range` / `invalid_limit` / `invalid_offset` / `invalid_cursor` | 参数不合法 |
+| 400 | `conflicting_pagination` | `cursor` 与 `offset` 同时给出 |
 | 405 | — | 非 GET 请求 |
+| 429 | `rate_limited` | 超出按 IP 的请求速率，响应带 `Retry-After` |
 | 503 | `query_timeout` | 查询超出时间预算，缩小地址或区间后重试 |
 | 500 | `internal` | 内部错误，细节只进日志 |
+
+限流按来源 IP 固定窗口计数，缺省 120 次/分钟（`HTTP_RATE_LIMIT`，设 0 关闭）。
+刻意不读 `X-Forwarded-For`：本服务没有可信反向代理，该头可被任意伪造。
 
 ---
 
 ## 局限（请先读这一段）
 
-1. **只覆盖一段区间。** 当前库内约 1.03 万块（26,422,714 起）。因此「持仓」是净变化、「授权」是区间内快照，**都不能直接当链上当前状态用**。
+1. **只覆盖一段区间。** 当前库内约 2.45 万块（26,422,714..26,447,172）。因此「持仓」是净变化、「授权」是区间内快照，**都不能直接当链上当前状态用**。
 2. **没有第三方交叉验证。** Etherscan API 需要 key（本项目不接受代注册），Blockscout 在开发机上不可达。现有的对拍是**同源回放**：用 `cmd/verify` 重新拉同一区间的 `eth_getLogs`，与库内逐字段比对（19 批 / 783,105 条 / 0 差异）。它能证明索引器忠实记录，**不能**证明我们对合约语义的理解与第三方一致。
 3. **免费端点的归档窗口约 10,000 块且滚动。** 索引器停机过久，`next_block` 会滑出窗口，`eth_getLogs` 报 `Archive requests require a personal token`，需要把 `START_BLOCK` 与游标回拨到窗口内。
-4. **`/api/stats` 的计数是全表聚合**，随数据量线性变慢；全量索引 USDC 后需要改成计数表或物化视图。
-5. **无鉴权、无限流**，只适合本机或内网。
-6. `/api/events` 的 `OFFSET` 深翻页会退化，需要游标分页时再补。
+4. **`/api/stats` 的计数是全表聚合**，随数据量线性变慢（当前 84.9 万行约 176 ms）。已加 10 秒进程内缓存挡住重复请求，但没有解决复杂度；全量索引 USDC 后仍需计数表或物化视图。
+5. **无鉴权**，只适合本机或内网。有限流（按 IP 固定窗口），但限流不等于鉴权。
+6. `/api/events` 已支持键集分页；为兼容旧调用保留了 `offset`，深翻页会退化，建议改用 `cursor`。
 
 ---
 
