@@ -67,7 +67,9 @@ func run() error {
 	}
 	defer st.Close()
 
-	client, err := chain.New(ctx, cfg.RPCHTTPURL, cfg.ChainID, chain.Options{})
+	client, err := chain.New(ctx, cfg.RPCHTTPURL, cfg.ChainID, chain.Options{
+		HeaderBatchSize: int(cfg.RPCHeaderBatch),
+	})
 	if err != nil {
 		return err
 	}
@@ -95,6 +97,7 @@ func run() error {
 		"start_block", cfg.StartBlock,
 		"confirmations", cfg.Confirmations,
 		"batch_blocks", cfg.BatchBlockRange,
+		"header_batch", cfg.RPCHeaderBatch,
 	)
 
 	scanner := indexer.New(client, client, st, dec, indexer.Config{

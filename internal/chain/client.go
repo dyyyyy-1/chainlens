@@ -50,6 +50,11 @@ type Options struct {
 	MaxAttempts int
 	// RetryBaseDelay 是指数退避的基准延迟。
 	RetryBaseDelay time.Duration
+	// HeaderBatchSize 是单次 JSON-RPC 批量请求容纳的块头数。
+	//
+	// 必须按端点实测能力设置：publicnode 允许 100，drpc 免费档只允许 3。
+	// 写死成常量会让「换端点补历史」在块头阶段直接失败。
+	HeaderBatchSize int
 }
 
 func (o Options) withDefaults() Options {
@@ -61,6 +66,9 @@ func (o Options) withDefaults() Options {
 	}
 	if o.RetryBaseDelay <= 0 {
 		o.RetryBaseDelay = defaultRetryBaseDelay
+	}
+	if o.HeaderBatchSize <= 0 {
+		o.HeaderBatchSize = headerBatchSize
 	}
 	return o
 }
@@ -159,8 +167,8 @@ func (c *Client) HeadersByRange(ctx context.Context, numbers []uint64) (map[uint
 
 	rawClient := c.eth.Client()
 
-	for start := 0; start < len(numbers); start += headerBatchSize {
-		chunk := numbers[start:min(start+headerBatchSize, len(numbers))]
+	for start := 0; start < len(numbers); start += c.opts.HeaderBatchSize {
+		chunk := numbers[start:min(start+c.opts.HeaderBatchSize, len(numbers))]
 
 		err := c.withRetry(ctx, "get headers", func(callCtx context.Context) error {
 			elems := make([]rpc.BatchElem, len(chunk))

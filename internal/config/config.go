@@ -22,16 +22,23 @@ type Config struct {
 	StartBlock      uint64
 	Confirmations   uint64
 	BatchBlockRange uint64
-	LogLevel        slog.Level
+	// RPCHeaderBatch 是单次批量请求容纳的块头数。
+	// publicnode 允许 100，drpc 免费档只允许 3；换端点补历史时必须一起改。
+	RPCHeaderBatch uint64
+	LogLevel       slog.Level
 	// HTTPAddr 是查询服务的监听地址，仅 cmd/api 使用。
 	HTTPAddr string
+	// HTTPRateLimit 是每个来源 IP 每分钟的请求上限，仅 cmd/api 使用。0 表示不限流。
+	HTTPRateLimit uint64
 }
 
 // .env 模板中的缺省值，仅在对应环境变量为空时生效。
 const (
 	defaultConfirmations   = 12
 	defaultBatchBlockRange = 2000
+	defaultHeaderBatch     = 100
 	defaultHTTPAddr        = ":8080"
+	defaultRateLimit       = 120
 )
 
 // Load 先读取 envFile（可为空串或不存在），再从进程环境变量解析配置。
@@ -74,6 +81,9 @@ func Load(envFile string) (Config, error) {
 	if cfg.BatchBlockRange, err = parseUint64("BATCH_BLOCK_RANGE", defaultBatchBlockRange); err != nil {
 		return Config{}, err
 	}
+	if cfg.RPCHeaderBatch, err = parseUint64("RPC_HEADER_BATCH", defaultHeaderBatch); err != nil {
+		return Config{}, err
+	}
 	if cfg.LogLevel, err = parseLogLevel("LOG_LEVEL"); err != nil {
 		return Config{}, err
 	}
@@ -100,6 +110,9 @@ func LoadServer(envFile string) (Config, error) {
 
 	var err error
 	if cfg.LogLevel, err = parseLogLevel("LOG_LEVEL"); err != nil {
+		return Config{}, err
+	}
+	if cfg.HTTPRateLimit, err = parseUint64("HTTP_RATE_LIMIT", defaultRateLimit); err != nil {
 		return Config{}, err
 	}
 
