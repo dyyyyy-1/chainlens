@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/jackc/pgx/v5"
 )
 
 // 本文件是 chain_log / decoded_event / index_cursor 的**只读**查询面，
@@ -208,29 +209,10 @@ func (s *Store) LogsByRange(ctx context.Context, from, to uint64) ([]LogRecord, 
 
 	records := make([]LogRecord, 0, 1024)
 	for rows.Next() {
-		var (
-			record                 LogRecord
-			txHash, contract       []byte
-			topic0, topic1, topic2 []byte
-			topic3, data           []byte
-			logIndex               int32
-		)
-		if err := rows.Scan(
-			&record.BlockNumber, &record.BlockTime, &txHash, &logIndex, &contract,
-			&topic0, &topic1, &topic2, &topic3, &data,
-		); err != nil {
-			return nil, fmt.Errorf("store: scan log: %w", err)
+		record, err := scanLogRecord(rows)
+		if err != nil {
+			return nil, err
 		}
-
-		record.TxHash = common.BytesToHash(txHash)
-		record.LogIndex = uint32(logIndex)
-		record.Contract = common.BytesToAddress(contract)
-		record.Topic0 = hashPtr(topic0)
-		record.Topic1 = hashPtr(topic1)
-		record.Topic2 = hashPtr(topic2)
-		record.Topic3 = hashPtr(topic3)
-		record.Data = data
-
 		records = append(records, record)
 	}
 	if err := rows.Err(); err != nil {
@@ -238,6 +220,37 @@ func (s *Store) LogsByRange(ctx context.Context, from, to uint64) ([]LogRecord, 
 	}
 
 	return records, nil
+}
+
+// scanLogRecord 读取一行 chain_log 的列布局。
+//
+// 与 logsByRangeSQL / undecodableLogsSQL 的 SELECT 列顺序绑定：两处查询必须保持
+// 同样的列顺序，否则会静默把 topic 装错列。
+func scanLogRecord(rows pgx.Rows) (LogRecord, error) {
+	var (
+		record                 LogRecord
+		txHash, contract       []byte
+		topic0, topic1, topic2 []byte
+		topic3, data           []byte
+		logIndex               int32
+	)
+	if err := rows.Scan(
+		&record.BlockNumber, &record.BlockTime, &txHash, &logIndex, &contract,
+		&topic0, &topic1, &topic2, &topic3, &data,
+	); err != nil {
+		return LogRecord{}, fmt.Errorf("store: scan log: %w", err)
+	}
+
+	record.TxHash = common.BytesToHash(txHash)
+	record.LogIndex = uint32(logIndex)
+	record.Contract = common.BytesToAddress(contract)
+	record.Topic0 = hashPtr(topic0)
+	record.Topic1 = hashPtr(topic1)
+	record.Topic2 = hashPtr(topic2)
+	record.Topic3 = hashPtr(topic3)
+	record.Data = data
+
+	return record, nil
 }
 
 // hashPtr 把可空 topic 列转成指针：NULL 与空字节都视为缺失。
