@@ -10,8 +10,10 @@ import {
   type Coverage,
   type Holding,
   type Interaction,
+  type Onchain,
+  type OnchainBalance,
 } from '../api'
-import { formatAmount, formatBlockTime, groupNumber, shortHex, USDC_DECIMALS } from '../format'
+import { formatAmount, formatBlockTime, formatUnits, groupNumber, shortHex } from '../format'
 import { CoverageBar } from './CoverageBar'
 
 interface ProfileState {
@@ -19,6 +21,7 @@ interface ProfileState {
   holdings: Holding[]
   approvals: Approval[]
   interactions: Interaction[]
+  onchain: Onchain
 }
 
 export function AddressProfile({ initialAddress }: { initialAddress: string }) {
@@ -50,6 +53,8 @@ export function AddressProfile({ initialAddress }: { initialAddress: string }) {
         holdings: balances.data,
         approvals: approvals.data,
         interactions: interactions.data,
+        // 旧后端没有 onchain 字段，按「未启用」处理，不能当成余额为零。
+        onchain: balances.onchain ?? { enabled: false },
       })
     } catch (failure) {
       setState(null)
@@ -93,8 +98,10 @@ export function AddressProfile({ initialAddress }: { initialAddress: string }) {
 
           <div className="panel">
             <div className="panel-head">
-              <span className="panel-title">代币净变化</span>
-              <span className="panel-hint">按合约聚合 Transfer 进出</span>
+              <span className="panel-title">代币余额与净变化</span>
+              <span className="panel-hint">
+                {state.onchain.enabled ? '净变化按索引区间聚合，余额实时查链' : '净变化按索引区间聚合'}
+              </span>
             </div>
             {state.holdings.length === 0 ? (
               <div className="empty">已索引区间内没有该地址的 Transfer</div>
@@ -105,6 +112,7 @@ export function AddressProfile({ initialAddress }: { initialAddress: string }) {
                     <tr>
                       <th>合约</th>
                       <th style={{ textAlign: 'right' }}>净变化</th>
+                      {state.onchain.enabled ? <th style={{ textAlign: 'right' }}>链上余额</th> : null}
                       <th style={{ textAlign: 'right' }}>日志条数</th>
                       <th>方向</th>
                     </tr>
@@ -119,6 +127,9 @@ export function AddressProfile({ initialAddress }: { initialAddress: string }) {
                           <td className="num" title={`原始整数：${amount.exact}`}>
                             {amount.display}
                           </td>
+                          {state.onchain.enabled ? (
+                            <OnchainCell entry={state.onchain.balances?.[holding.contract]} />
+                          ) : null}
                           <td className="num">{groupNumber(holding.log_count)}</td>
                           <td>
                             <span className={`tag ${isOutflow ? 'tag-outflow' : 'tag-inflow'}`}>
@@ -132,9 +143,24 @@ export function AddressProfile({ initialAddress }: { initialAddress: string }) {
                 </table>
               </div>
             )}
+            {state.onchain.enabled && state.onchain.error ? (
+              <div className="error">链上余额暂时取不到（RPC 不可用或超时），净变化不受影响。</div>
+            ) : null}
             <div className="note">
-              这是<strong>已索引区间内的净变化</strong>，不是余额。区间外的流水看不到，所以活跃地址的净额完全可能为负。
-              真实余额要查链上 <code>balanceOf()</code>。金额按 {USDC_DECIMALS} 位小数换算，视为 USDC。
+              <strong>净变化</strong>是已索引区间内的累加，不是余额：区间外的流水看不到，活跃地址完全可能为负。
+              {state.onchain.enabled ? (
+                <>
+                  <strong>链上余额</strong>由查询服务实时调用 <code>balanceOf()</code> 取得，
+                  悬停可见抓取时间；它不受索引区间限制，但可能落后链头几个区块。
+                </>
+              ) : (
+                <>
+                  真实余额要查链上 <code>balanceOf()</code>，当前查询服务未配置 RPC。
+                </>
+              )}
+              {state.holdings.some((holding) => state.onchain.balances?.[holding.contract]?.decimals === null)
+                ? ' 部分代币未取到小数位，金额按 6 位显示，仅供参考。'
+                : ''}
             </div>
           </div>
 
@@ -221,5 +247,38 @@ export function AddressProfile({ initialAddress }: { initialAddress: string }) {
         </>
       ) : null}
     </div>
+  )
+}
+
+/** OnchainCell 渲染单条链上余额：拿不到就明说，绝不显示 0。 */
+function OnchainCell({ entry }: { entry: OnchainBalance | undefined }) {
+  if (!entry) {
+    return <td className="num">—</td>
+  }
+
+  if (entry.status !== 'ok' || entry.value === undefined) {
+    return (
+      <td className="num">
+        <span className="tag tag-warn" title="RPC 不可用或查询超时">
+          获取失败
+        </span>
+      </td>
+    )
+  }
+
+  // 精度未知时不猜：错一个数量级的金额，比一句「精度未知」更糟。
+  if (entry.decimals === null) {
+    return (
+      <td className="num" title={`原始整数：${entry.value}`}>
+        精度未知
+      </td>
+    )
+  }
+
+  const fetched = entry.fetched_at ? `，抓取于 ${formatBlockTime(entry.fetched_at)}` : ''
+  return (
+    <td className="num" title={`原始整数：${entry.value}${fetched}`}>
+      {formatUnits(entry.value, entry.decimals)}
+    </td>
   )
 }

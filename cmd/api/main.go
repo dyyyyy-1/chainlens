@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/dyyyyy-1/chainlens/internal/api"
+	"github.com/dyyyyy-1/chainlens/internal/chain"
 	"github.com/dyyyyy-1/chainlens/internal/config"
 	"github.com/dyyyyy-1/chainlens/internal/profile"
 	"github.com/dyyyyy-1/chainlens/internal/store"
@@ -68,12 +69,34 @@ func run() error {
 	}
 	defer st.Close()
 
+	// 链上余额是可选能力：RPC 与链 ID 都配置了才启用。
+	//
+	// 连不上也不能让查询服务起不来——画像的主数据（持仓、授权、交互）全在本地库，
+	// 余额只是锦上添花。因此这里失败只降级，不返回错误。
+	var tokens api.TokenReader
+	if cfg.RPCHTTPURL != "" && cfg.ChainID != 0 {
+		client, err := chain.New(ctx, cfg.RPCHTTPURL, cfg.ChainID, chain.Options{
+			// 启动时只做一次链 ID 校验，用短预算：RPC 不通时不该把启动卡住几分钟。
+			RequestTimeout: 5 * time.Second,
+			MaxAttempts:    1,
+		})
+		if err != nil {
+			slog.Warn("onchain balance disabled: rpc unavailable", "url", cfg.RPCHTTPURL, "err", err)
+		} else {
+			defer client.Close()
+			tokens = client
+		}
+	} else {
+		slog.Info("onchain balance disabled", "hint", "配置 RPC_HTTP_URL 与 CHAIN_ID 后启用")
+	}
+
 	handler := api.NewRouter(api.Deps{
 		Events:             st,
 		Profile:            profile.New(st.Pool()),
 		Logger:             slog.Default(),
 		RateLimitPerMinute: int(cfg.HTTPRateLimit),
-		APIToken:           cfg.APIToken,
+		APITokens:          cfg.APITokens,
+		Tokens:             tokens,
 		WebDir:             cfg.WebDir,
 	})
 

@@ -77,6 +77,33 @@ type holdingDTO struct {
 	LogCount int64  `json:"log_count"`
 }
 
+// balancesResponseDTO 在通用信封之外多给一个 onchain 块。
+//
+// 余额是**可选**能力：查询服务不一定配置了 RPC。用 enabled=false 明确表达
+// 「没有这个能力」，而不是回 0 让人误读成「余额为零」。
+type balancesResponseDTO struct {
+	Coverage coverageDTO  `json:"coverage"`
+	Data     []holdingDTO `json:"data"`
+	Onchain  onchainDTO   `json:"onchain"`
+}
+
+type onchainDTO struct {
+	Enabled  bool                         `json:"enabled"`
+	Balances map[string]onchainBalanceDTO `json:"balances,omitempty"`
+	// Error 只在所有代币都失败时给出，避免调用方逐条翻 balances 才知道 RPC 挂了。
+	Error string `json:"error,omitempty"`
+}
+
+type onchainBalanceDTO struct {
+	// Value 是原始整数（未按 decimals 换算），失败时为空。
+	Value string `json:"value,omitempty"`
+	// Decimals 为 null 表示未知：调用方不得拿默认值猜，否则金额会差 10^N。
+	Decimals  *int   `json:"decimals"`
+	FetchedAt string `json:"fetched_at,omitempty"`
+	Cached    bool   `json:"cached"`
+	Status    string `json:"status"`
+}
+
 type approvalDTO struct {
 	Contract    string `json:"contract"`
 	Spender     string `json:"spender"`
@@ -168,7 +195,58 @@ func (d Deps) handleBalances(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	d.writeData(w, r, items)
+	coverage, err := d.Events.Coverage(r.Context())
+	if err != nil {
+		d.fail(w, r, err)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, balancesResponseDTO{
+		Coverage: toCoverageDTO(coverage),
+		Data:     items,
+		Onchain:  d.onchainSnapshot(r.Context(), addr, holdings),
+	})
+}
+
+// onchainSnapshot 组装链上余额块；未配置 RPC 时只给 enabled=false。
+func (d Deps) onchainSnapshot(ctx context.Context, holder common.Address, holdings []profile.Holding) onchainDTO {
+	if d.balance == nil {
+		return onchainDTO{Enabled: false}
+	}
+
+	snapshot := d.balance.snapshot(ctx, holder, holdingContracts(holdings))
+	balances := make(map[string]onchainBalanceDTO, len(snapshot))
+	failed := 0
+
+	for contract, entry := range snapshot {
+		dto := onchainBalanceDTO{
+			Status:    "ok",
+			FetchedAt: formatTime(entry.FetchedAt),
+			Cached:    entry.Cached,
+			Decimals:  entry.Decimals,
+		}
+
+		if entry.Err != "" {
+			dto.Status = entry.Err
+			failed++
+			// 原始错误只进日志：它可能含 RPC 端点与内部提示，不该出现在响应里。
+			d.logger().Warn("onchain balance unavailable",
+				"holder", hexAddress(holder),
+				"token", contract,
+				"err", entry.cause,
+			)
+		} else {
+			dto.Value = entry.Value.String()
+		}
+
+		balances[contract] = dto
+	}
+
+	result := onchainDTO{Enabled: true, Balances: balances}
+	if len(snapshot) > 0 && failed == len(snapshot) {
+		result.Error = "rpc_unavailable"
+	}
+	return result
 }
 
 func (d Deps) handleApprovals(w http.ResponseWriter, r *http.Request) {

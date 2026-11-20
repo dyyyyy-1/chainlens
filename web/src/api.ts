@@ -37,6 +37,31 @@ export interface Holding {
   log_count: number
 }
 
+/**
+ * OnchainBalance 是链上余额快照。
+ *
+ * `decimals` 为 null 表示后端不知道小数位——此时**不得**退回默认值，
+ * 否则金额会差 10^N。界面应显示「精度未知」而不是一个看起来正确的错误数字。
+ */
+export interface OnchainBalance {
+  value?: string
+  decimals: number | null
+  fetched_at?: string
+  cached: boolean
+  status: 'ok' | 'unavailable' | string
+}
+
+/** Onchain 是可选能力：enabled=false 表示查询服务没配 RPC，不是「余额为 0」。 */
+export interface Onchain {
+  enabled: boolean
+  balances?: Record<string, OnchainBalance>
+  error?: string
+}
+
+export interface BalancesEnvelope extends Envelope<Holding[]> {
+  onchain: Onchain
+}
+
 export interface Approval {
   contract: string
   spender: string
@@ -129,8 +154,8 @@ export function fetchStats(): Promise<Envelope<StatsPayload>> {
   return request<Envelope<StatsPayload>>('/api/stats')
 }
 
-export function fetchBalances(address: string, limit = 50): Promise<Envelope<Holding[]>> {
-  return request<Envelope<Holding[]>>(`/api/address/${address}/balances?limit=${limit}`)
+export function fetchBalances(address: string, limit = 50): Promise<BalancesEnvelope> {
+  return request<BalancesEnvelope>(`/api/address/${address}/balances?limit=${limit}`)
 }
 
 export function fetchApprovals(address: string, limit = 50): Promise<Envelope<Approval[]>> {

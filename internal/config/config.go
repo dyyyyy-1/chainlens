@@ -30,8 +30,11 @@ type Config struct {
 	HTTPAddr string
 	// HTTPRateLimit 是每个来源 IP 每分钟的请求上限，仅 cmd/api 使用。0 表示不限流。
 	HTTPRateLimit uint64
-	// APIToken 非空时查询服务要求 Bearer token，仅 cmd/api 使用。
-	APIToken string
+	// APITokens 非空时查询服务要求 Bearer token，仅 cmd/api 使用。
+	//
+	// 支持逗号分隔多值（`API_TOKEN=old,new`）：轮换时新旧口令可并存，
+	// 不必让调用方在同一时刻切换。口令本身不能包含逗号。
+	APITokens []string
 	// WebDir 是前端构建产物目录，仅 cmd/api 使用。为空表示不托管前端。
 	WebDir string
 }
@@ -111,8 +114,14 @@ func LoadServer(envFile string) (Config, error) {
 	cfg := Config{
 		DatabaseURL: os.Getenv("DATABASE_URL"),
 		HTTPAddr:    httpAddr(),
-		APIToken:    strings.TrimSpace(os.Getenv("API_TOKEN")),
+		APITokens:   splitTokens(os.Getenv("API_TOKEN")),
 		WebDir:      strings.TrimSpace(os.Getenv("WEB_DIR")),
+		// TARGET_CONTRACT 只有 cmd/redecode 用到（按合约取 ABI），查询服务本身不读它。
+		// 集中在这里解析，避免各命令各自 os.Getenv 出一套不一致的默认值。
+		TargetContract: strings.TrimSpace(os.Getenv("TARGET_CONTRACT")),
+		// 链上余额是可选能力：只配置其中一个变量不足以安全调用 RPC
+		// （chain 层要靠 CHAIN_ID 拒绝主网与测试网混用），因此两者缺一即视为未启用。
+		RPCHTTPURL: strings.TrimSpace(os.Getenv("RPC_HTTP_URL")),
 	}
 	if cfg.WebDir == "" {
 		cfg.WebDir = defaultWebDir
@@ -123,6 +132,9 @@ func LoadServer(envFile string) (Config, error) {
 	}
 
 	var err error
+	if cfg.ChainID, err = parseUint64("CHAIN_ID", 0); err != nil {
+		return Config{}, err
+	}
 	if cfg.LogLevel, err = parseLogLevel("LOG_LEVEL"); err != nil {
 		return Config{}, err
 	}
@@ -188,6 +200,36 @@ func unquote(value string) string {
 	return value
 }
 
+// splitTokens 把逗号分隔的口令串切成列表，去掉空白与空项并按首次出现去重。
+//
+// 去重不是洁癖：重复项会让「有几个口令」这件事在日志与配置对账时对不上。
+func splitTokens(raw string) []string {
+	if strings.TrimSpace(raw) == "" {
+		return nil
+	}
+
+	parts := strings.Split(raw, ",")
+	tokens := make([]string, 0, len(parts))
+	seen := make(map[string]struct{}, len(parts))
+	for _, part := range parts {
+		token := strings.TrimSpace(part)
+		if token == "" {
+			continue
+		}
+		if _, duplicate := seen[token]; duplicate {
+			continue
+		}
+		seen[token] = struct{}{}
+		tokens = append(tokens, token)
+	}
+
+	if len(tokens) == 0 {
+		return nil
+	}
+	return tokens
+}
+
+// parseUint64 解析十进制无符号整数，空值回落到 fallback。
 func parseUint64(key string, fallback uint64) (uint64, error) {
 	raw := strings.TrimSpace(os.Getenv(key))
 	if raw == "" {
