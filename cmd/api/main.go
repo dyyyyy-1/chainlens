@@ -73,6 +73,7 @@ func run() error {
 		Profile:            profile.New(st.Pool()),
 		Logger:             slog.Default(),
 		RateLimitPerMinute: int(cfg.HTTPRateLimit),
+		APIToken:           cfg.APIToken,
 	})
 
 	server := &http.Server{

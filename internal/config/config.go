@@ -30,6 +30,8 @@ type Config struct {
 	HTTPAddr string
 	// HTTPRateLimit 是每个来源 IP 每分钟的请求上限，仅 cmd/api 使用。0 表示不限流。
 	HTTPRateLimit uint64
+	// APIToken 非空时查询服务要求 Bearer token，仅 cmd/api 使用。
+	APIToken string
 }
 
 // .env 模板中的缺省值，仅在对应环境变量为空时生效。
@@ -106,6 +108,7 @@ func LoadServer(envFile string) (Config, error) {
 	cfg := Config{
 		DatabaseURL: os.Getenv("DATABASE_URL"),
 		HTTPAddr:    httpAddr(),
+		APIToken:    strings.TrimSpace(os.Getenv("API_TOKEN")),
 	}
 
 	var err error

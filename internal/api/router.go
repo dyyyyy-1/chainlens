@@ -44,6 +44,8 @@ type Deps struct {
 	Logger  *slog.Logger
 	// RateLimitPerMinute 是每个来源 IP 每分钟允许的请求数；<=0 表示不限流。
 	RateLimitPerMinute int
+	// APIToken 非空时要求 Bearer token；为空表示不启用鉴权。
+	APIToken string
 }
 
 // NewRouter 组装路由与中间件。
@@ -63,7 +65,8 @@ func NewRouter(d Deps) http.Handler {
 	mux.HandleFunc("GET /api/address/{addr}/interactions", d.handleInteractions)
 	mux.HandleFunc("GET /api/stats", d.handleStats)
 
-	return d.observe(rateLimited(newRateLimiter(d.RateLimitPerMinute), mux))
+	handler := authRequired(d.APIToken, mux)
+	return d.observe(rateLimited(newRateLimiter(d.RateLimitPerMinute), handler))
 }
 
 // withCachedStats 返回一个把 /api/stats 计数缓存起来的 Deps。
