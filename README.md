@@ -62,7 +62,7 @@ curl -s "localhost:8080/api/address/0x000000000004444c5dc75cb358380d2e3de08a90/b
 | `RPC_HEADER_BATCH` | 单次批量请求的块头数，默认 100。publicnode 允许 100，drpc 免费档只允许 3 |
 | `HTTP_ADDR` | 查询服务监听地址，默认 `:8080` |
 | `HTTP_RATE_LIMIT` | 每 IP 每分钟请求上限，默认 120；0 关闭 |
-| `API_TOKEN` | 非空时要求 `Authorization: Bearer <token>`；留空不鉴权 |
+| `API_TOKEN` | 非空时要求 `Authorization: Bearer <token>`；留空不鉴权。支持逗号分隔多值（`old,new`）以便轮换 |
 | `WEB_DIR` | 前端构建产物目录，默认 `web/dist`；目录不存在则不托管前端 |
 
 ---
@@ -181,6 +181,9 @@ curl -s "localhost:8080/api/address/0x000000000004444c5dc75cb358380d2e3de08a90/b
 
 `stale_seconds` 是「最新索引区块的时间」与当前时刻之差，用来判断数据新鲜度。
 
+上面的数字是 2026-11-17 的快照。存量 3,978 条 `undecodable` 已于 2026-11-20 离线重解
+（`go run ./cmd/redecode -apply`），该字段现为 0。
+
 ### `GET /api/events`
 
 参数：`contract`（地址）、`from` / `to`（区块区间）、`limit`（默认 50，上限 200）、
@@ -212,10 +215,32 @@ curl -s "localhost:8080/api/address/0x000000000004444c5dc75cb358380d2e3de08a90/b
 ### `GET /api/address/{addr}/balances`
 
 ```json
-{"data": [{"contract": "0xa0b8...eb48", "net": "-3258700130159", "log_count": 57210}]}
+{
+  "coverage": {"from_block": 26422714, "to_block": 26455400, "next_block": 26455401},
+  "data": [{"contract": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48", "net": "-7202785433099", "log_count": 204534}],
+  "onchain": {
+    "enabled": true,
+    "balances": {
+      "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48": {
+        "value": "31727695396940",
+        "decimals": 6,
+        "fetched_at": "2026-11-20T09:22:50Z",
+        "cached": false,
+        "status": "ok"
+      }
+    }
+  }
+}
 ```
 
-`net` 是**已索引区间内的净变化**，不是余额。区间外的历史流水不可见，活跃地址完全可能为负。要看真实余额必须查链上 `balanceOf`。
+`net` 是**已索引区间内的净变化**，不是余额。区间外的历史流水不可见，活跃地址完全可能为负。
+
+`onchain` 是**可选**能力，语义与 `data` 完全不同：它实时调用链上 `balanceOf()`，不受索引区间限制。
+
+- `enabled=false`（未配置 `RPC_HTTP_URL` / `CHAIN_ID`）表示服务没有这个能力，**不是余额为 0**。
+- 单条查询失败时该条为 `status="unavailable"` 且不给 `value`，其余字段照常返回；全部失败时额外给 `onchain.error="rpc_unavailable"`。
+- `decimals` 为 `null` 表示未取到精度，调用方**不得**用默认值猜，否则金额会差 10^N。
+- `value` 是未换算的原始整数（十进制字符串）。余额缓存 10 秒，`cached` 标记是否命中缓存。
 
 ### `GET /api/address/{addr}/approvals`
 
@@ -290,14 +315,16 @@ npm run dev      # http://localhost:5173
 
 ## 局限（请先读这一段）
 
-1. **只覆盖一段区间。** 当前库内约 3.11 万块（26,422,714..26,453,825）。因此「持仓」是净变化、「授权」是区间内快照，**都不能直接当链上当前状态用**。
+1. **只覆盖一段区间。** 当前库内约 3.27 万块（26,422,714..26,455,389，随索引器推进）。因此「净变化」是区间内累加、「授权」是区间内快照，**都不能直接当链上当前状态用**。链上余额（`onchain`）不受此限，但它是实时值，不是历史快照。
 2. **没有第三方交叉验证。** Etherscan API 需要 key（本项目不接受代注册），Blockscout 在开发机上不可达。现有的对拍是**同源回放**：用 `cmd/verify` 重新拉同一区间的 `eth_getLogs`，与库内逐字段比对（19 批 / 783,105 条 / 0 差异）。它能证明索引器忠实记录，**不能**证明我们对合约语义的理解与第三方一致。
 3. **免费端点的归档窗口约 10,000 块且滚动。** 索引器停机过久，`next_block` 会滑出窗口，`eth_getLogs` 报 `Archive requests require a personal token`，需要把 `START_BLOCK` 与游标回拨到窗口内。
 4. **`/api/stats` 的计数是全表聚合**，随数据量线性变慢（84.9 万行 176 ms → 279 万行 360 ms，约线性）。已加 10 秒进程内缓存挡住重复请求，但没有解决复杂度；全量索引 USDC 后仍需计数表或物化视图。
 5. **鉴权是可选的静态共享密钥**（`API_TOKEN`），默认关闭。它能回答「调用方是否知道口令」，
-   但不能区分调用者、不能单独撤销、也没有细粒度授权。要这些能力需要真正的认证服务。
+   但不能区分调用者身份、不能单独撤销某一个调用方、也没有细粒度授权。多值写法只解决轮换，
+   不构成身份体系；访问日志里的 token 指纹只能做粗粒度归因。要真身份需要认证服务。
 6. `/api/events` 已支持键集分页；为兼容旧调用保留了 `offset`，深翻页会退化，建议改用 `cursor`。
-7. **前端按 USDC 的 6 位小数格式化金额**。索引其他代币时需要让接口返回 decimals，否则显示差 10^N。
+7. **净变化仍按 USDC 的 6 位小数格式化**（`Holdings` 还没返回每个合约的 decimals）。链上余额已改用接口返回的 `decimals`，未知时界面显示「精度未知」而不是猜一个值。索引其他代币前需要补 F4。
+8. **链上余额依赖 RPC 端点。** 免费端点限流或不可达时该字段降级为 `unavailable`，不影响其余接口；但它意味着查询服务的可用性不再只由数据库决定。
 
 ---
 

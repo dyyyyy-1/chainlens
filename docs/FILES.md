@@ -15,6 +15,7 @@
 | `cmd/api/main.go` | 查询服务入口。装载配置 → **只建一个连接池**（`store.New`）→ `profile.New(st.Pool())` 复用同一个池 → 启动 `http.Server` 并处理优雅退出。含 `ReadHeaderTimeout` / `IdleTimeout` / `Shutdown` 三项超时。 | W3D3 |
 | `cmd/verify/main.go` | 回放对拍工具。对同一区间重新 `eth_getLogs`，与 `chain_log` 按 `(tx_hash, log_index)` 逐字段比对（含 `block_time`），报告缺失/多余/不一致。**运行时二分探测归档边界**，只核对可回放部分，不把「超出窗口」误报成「数据缺失」。退出码 0/1/2。 | W4 |
 | `cmd/verify/main_test.go` | 证明比对函数**能发现差异**（缺失 / 多余 / data 改动 / 块时间漂移），以及区间收敛的边界。没有这组用例，「0 差异」的结论不可信。 | W4 |
+| `cmd/redecode/main.go` | **离线重解**存量 `undecodable` 日志：从 `chain_log` 读原始日志、用 `contract_meta` 里的 ABI 重解、按块区间分批覆盖写 `decoded_event`。**不访问 RPC、不碰 `index_cursor`、不改 `chain_log`**，因此与索引器可并存。默认 dry-run，`-apply` 才写库。 | 交接后（2026-11-20） |
 
 ---
 
@@ -26,6 +27,7 @@
 |---|---|---|
 | `client.go` | 连接管理、超时、重试、链 ID 校验。导出 `New` / `HeaderByNumber` / `LatestBlockNumber` / `HeadersByRange` / `Close`。 | W1D1、W1D2 |
 | `logs.go` | `Fetch`：按区块区间走 `eth_getLogs` 拉日志（ADR-2），带区间合法性校验与 2000 块上限。 | W1D1 |
+| `token.go` | ERC-20 只读调用：`BalanceOf` / `Decimals`。选择器手写（`0x70a08231` / `0x313ce567`），不解析整份 ABI。**刻意不重试**：它服务在线查询，调用方只有几秒预算，重试会把「快速失败并降级」变成「拖垮整个响应」。 | 交接后（2026-11-20） |
 
 **为什么重试写在 `client.go` 而不是独立文件**：重试是调用语义的一部分，只有本包的调用点使用；抽出去反而要暴露内部状态。
 
@@ -67,10 +69,10 @@
 | `models.go` | `Store` 类型、连接池构造与 `Begin`/`Close`；四个记录类型 `LogRecord` / `HeaderRecord` / `DecodedRecord` / `Cursor`；`NewLogRecord` 负责 `types.Log` → 记录的转换。 | W1D2、W1D3 |
 | `logs.go` | `InsertLogs`：临时表中转 + COPY + 幂等合并（见下）。 | W1D2 |
 | `headers.go` | `InsertHeaders`：`unnest` 数组参数一次写入多行块头。 | W1D2 |
-| `decoded.go` | `InsertDecoded`：`unnest` 写入解码结果，`payload` 以 JSON 文本传入后在库内转 `jsonb`。 | W1D3 |
+| `decoded.go` | `InsertDecoded`（索引器用，冲突 `DO NOTHING`）、`UpsertDecoded`（重解用，冲突 `DO UPDATE`）、`UndecodableSummary`、`UndecodableLogs`（区间内未解码的原始日志）。两种冲突动作的差别就是「重扫不应改写」与「重解必须改写」。 | W1D3、交接后 |
 | `meta.go` | `UpsertContractMeta` / `LoadContractMeta`：代理识别结果的读写。`abi` 用 `COALESCE` 更新，避免重复解析时把已获取的 ABI 覆盖成空。 | W2D1 |
 | `cursor.go` | `EnsureCursor` / `LoadCursor` / `Advance`。游标推进必须由调用方传入事务。 | W1D2 |
-| `query.go` | 只读查询面：`ListEvents`（按合约/区间过滤，支持键集游标，条件按需拼接）、`Coverage`（已索引区间）、`Stats`（水位 + 事件计数）、`LogsByRange`（区间原始日志，供 `cmd/verify` 对拍与导出）。与写路径分开：写路径服务于索引器的事务语义，读路径服务于查询服务。 | W3D3、W4 |
+| `query.go` | 只读查询面：`ListEvents`（按合约/区间过滤，支持键集游标，条件按需拼接）、`Coverage`（已索引区间）、`Stats`（水位 + 事件计数）、`LogsByRange`（区间原始日志，供 `cmd/verify` 对拍与导出）。与写路径分开：写路径服务于索引器的事务语义，读路径服务于查询服务。行扫描逻辑由 `scanLogRecord` 共用，避免两条查询的列顺序各写一遍。 | W3D3、W4 |
 
 **`logs.go` 为什么这么绕（临时表 → COPY → INSERT ... ON CONFLICT）**：
 PostgreSQL 的 `COPY` 协议不支持 `ON CONFLICT`，而 §8.4 同时要求「COPY 批量写」与「冲突时静默跳过」。解法是事务内建 `TEMP TABLE ... (LIKE chain_log) ON COMMIT DROP`（`LIKE` 默认不带主键约束，灌入不会因重复中断），COPY 进临时表后再用 `INSERT ... SELECT ... ON CONFLICT (tx_hash, log_index) DO NOTHING` 合并。返回值是 `RowsAffected()`，即**实际新增行数**——重扫时恒为 0，这就是幂等的判定依据。
@@ -104,10 +106,11 @@ PostgreSQL 的 `COPY` 协议不支持 `ON CONFLICT`，而 §8.4 同时要求「C
 
 | 文件 | 职责 | 阶段 |
 |---|---|---|
-| `router.go` | 路由（5 个端点）、`EventStore` / `ProfileReader` 两个窄接口、请求中间件（超时预算、panic 恢复、访问日志、状态码记录）、按 IP 限流的接线。 | W3D3、加固 |
-| `handlers.go` | 参数解析与校验（含键集游标）、错误映射（超时 → 503、内部错误 → 500 且不泄露 SQL）、响应 DTO 与 `coverage` 封装、hex 与时间格式化。 | W3D3、加固 |
+| `router.go` | 路由（5 个端点）、`EventStore` / `ProfileReader` / `TokenReader` 三个窄接口、请求中间件（超时预算、panic 恢复、访问日志、状态码记录）、按 IP 限流的接线。`withBalance` 在配置了 `Tokens` 时注入余额服务，未配置则保持 nil。 | W3D3、加固、交接后 |
+| `handlers.go` | 参数解析与校验（含键集游标）、错误映射（超时 → 503、内部错误 → 500 且不泄露 SQL）、响应 DTO 与 `coverage` 封装、hex 与时间格式化。`/balances` 用专用 DTO：`data` 是区间净变化，`onchain` 是可选的链上余额，两者语义不同故不混在同一层。 | W3D3、加固、交接后 |
+| `balance.go` | 链上余额的编排：`TokenReader` 窄接口、并发查询（每个代币一个 goroutine，上限 5 个）、两级缓存（余额 10s / decimals 1h）、过期清理。单代币失败只影响该单元格，并回 `status=unavailable` + 顶层 `onchain.error`。 | 交接后（2026-11-20） |
 | `static.go` | 托管前端构建产物并做 SPA 回退。`/api/*` 的未匹配路径**不回退**到 index.html，而是返回 JSON 404——否则客户端会拿到 200 + HTML，把「接口不存在」误读成「接口返回了奇怪的东西」。路径先 `path.Clean` 再拼接，防止穿越。 | 前端 |
-| `auth.go` | 可选的 Bearer token 校验：`API_TOKEN` 非空时启用，空则完全不介入。定长比较避免泄漏前缀匹配长度；方案名大小写不敏感。**这是静态共享密钥，不是身份体系。** | 加固 |
+| `auth.go` | 可选的 Bearer token 校验：`API_TOKEN` 为空时完全不介入。该变量支持**逗号分隔多口令**以便轮换（新旧并存，不必让调用方同一刻切换），逐个定长比较且**不短路**（短路会通过响应时间泄漏命中顺序）。`tokenFingerprint` 给访问日志提供 SHA-256 前 4 字节指纹，能区分调用方而不落明文。**这仍是静态共享密钥，不是身份体系。** | 加固、交接后 |
 | `stats_cache.go` | 给 `/api/stats` 的计数加 10 秒进程内缓存（只包 `Stats`，不包事件检索与覆盖区间）。持有互斥锁完成查询，顺带做单飞，避免并发打进来时多个请求同时做全表聚合。错误不进缓存。 | 加固 |
 | `ratelimit.go` | 按来源 IP 的固定窗口限流，缺省 120 次/分钟，`0` 关闭。限流表设容量上限并清理过期条目。**刻意不读 `X-Forwarded-For`**：本服务没有可信代理，该头可被伪造。 | 加固 |
 | `handlers_test.go` | 全离线的假实现测试：路由匹配、地址/区间/limit 校验、超时映射、错误不泄露内部细节、大写地址统一转小写、`2^256-1` 精确输出。 | W3D3 |
@@ -122,7 +125,7 @@ PostgreSQL 的 `COPY` 协议不支持 `ON CONFLICT`，而 §8.4 同时要求「C
 
 | 文件 | 职责 | 阶段 |
 |---|---|---|
-| `config.go` | 用标准库解析 `.env`（约 40 行，不引 godotenv），再映射到 `Config`。真实环境变量优先于文件；`.env` 不存在不报错。`RPC_HTTP_URL` 与 `CHAIN_ID` 必填——**仅对 `Load`（索引器）**；`LoadServer`（查询服务）只要求 `DATABASE_URL` 与 `HTTP_ADDR`。 | W1D1、W3D3 |
+| `config.go` | 用标准库解析 `.env`（约 40 行，不引 godotenv），再映射到 `Config`。真实环境变量优先于文件；`.env` 不存在不报错。`RPC_HTTP_URL` 与 `CHAIN_ID` 必填——**仅对 `Load`（索引器）**；`LoadServer`（查询服务 / `cmd/redecode`）只要求 `DATABASE_URL`，并把 `RPC_HTTP_URL` / `CHAIN_ID` 当作**可选**（缺一即关闭链上余额）。`API_TOKEN` 经 `splitTokens` 支持逗号分隔多值。 | W1D1、W3D3、交接后 |
 
 ---
 
@@ -147,20 +150,24 @@ PostgreSQL 的 `COPY` 协议不支持 `ON CONFLICT`，而 §8.4 同时要求「C
 | `web/src/format.ts` | 金额与地址格式化。**全程字符串运算**：uint256 超出 `Number.MAX_SAFE_INTEGER`，转 number 是不可逆的精度丢失。 |
 | `web/src/App.tsx` | 顶栏、三个标签页、token 输入（存 localStorage）。改 token 时以 token 为 key 重新挂载，自动按新凭据重取。 |
 | `web/src/components/StatsPanel.tsx` | 索引统计。指标卡 + 覆盖区间 + 数据新鲜度。 |
-| `web/src/components/AddressProfile.tsx` | 地址画像。三个表（净变化 / 授权 / 交互），各表下方写明语义边界。 |
+| `web/src/components/AddressProfile.tsx` | 地址画像。三个表（余额与净变化 / 授权 / 交互），各表下方写明语义边界。链上余额列只在 `onchain.enabled` 时出现；取不到就写「获取失败」，`decimals` 为 null 就写「精度未知」——不猜、不回 0。 |
 | `web/src/components/EventExplorer.tsx` | 事件检索。过滤 + 游标翻页；参数按事件类型（Transfer / Approval / 其他）压成一行。 |
 | `web/src/components/CoverageBar.tsx` | 覆盖区间条。空结果必须能区分「确实没有记录」与「这段历史还没索引」。 |
 | `web/src/styles.css` | 暗色设计系统（CSS 变量、卡片、表格、语义标签）。无第三方样式库。 |
 
 **为什么不用 UI 框架**：三个视图、两张表、若干输入框，手写 CSS 足以覆盖；引入组件库会带来版本跟进与主题覆盖成本，且页面风格要贴合「终端工具」而非「后台管理系统」。
 
-**已知短板**：金额小数位是前端常量（按 USDC 6 位）。索引其他代币时需让接口返回 decimals。
+**已知短板**：`net`（区间净变化）仍按 USDC 6 位换算——它是按合约聚合的，而 `Holdings` 还没有返回每个合约的 decimals。链上余额已用接口返回的 `decimals`，不再写死（F4 完成后 `net` 也一并解决）。
 
 ## 工程配置
 
 | 文件 | 职责 | 阶段 |
 |---|---|---|
-| `Makefile` | `build` / `vet` / `fmt` / `fmt-check` / `migrate` / `db-reset` / `probe`。 | W1D1 |
+| `Makefile` | `build` / `vet` / `fmt` / `fmt-check` / `migrate` / `db-reset` / `probe`。**本机没有 make，实际入口是 `scripts/check.sh`**；Makefile 保留给装了 make 的环境。 | W1D1 |
+| `scripts/check.sh` | 本地质量门禁：`build` / `vet` / `test` / `gofumpt` + 前端 `lint` / `build`。与 CI 保持一致，避免「本地绿、CI 红」。`SKIP_WEB=1` 可只查 Go。 | 交接后（2026-11-20） |
+| `.gitattributes` | 统一 LF（`* text=auto eol=lf`），二进制文件不做转换。消除 Windows 上持续的 CRLF 警告，也防止 shell 脚本被 CRLF 破坏。 | 交接后（2026-11-20） |
+| `.github/workflows/ci.yml` | GitHub Actions：Go 侧 `gofumpt` / `build` / `vet` / `test`，前端侧 `npm ci` / `lint` / `build`。**不启动数据库**：`internal/profile` 的集成测试由 `CHAINLENS_TEST_DSN` 门控，未设置时按设计跳过。 | 交接后（2026-11-20） |
+| `LICENSE` | MIT。仓库是 Public，未声明许可等于默认保留所有权利，会挡住复用。 | 交接后（2026-11-20） |
 | `.env.example` | §10 的环境变量模板，入库。真实 `.env` 在 `.gitignore` 内。W3D3 追加 `HTTP_ADDR`（仅查询服务读取）。 | W1D1、W3D3 |
 | `.gitignore` | 排除 `.env`、`.workbuddy/`（本地工作记录，含本机口令）、Go 构建产物。 | W1D1 |
 | `go.mod` / `go.sum` | 依赖锁定。仍只有 `go-ethereum` 与 `pgx/v5` 两个直接依赖。查询服务的路由用标准库 `ServeMux`，没有引入 chi（见 `internal/api` 一节）。 | W1D1、W3D3 |
@@ -193,4 +200,4 @@ PostgreSQL 的 `COPY` 协议不支持 `ON CONFLICT`，而 §8.4 同时要求「C
 
 | 文件 | 里程碑 / 状态 |
 |---|---|
-| `cmd/redecode/main.go` | **用户明确暂缓**。用途：按区间删除 `decoded_event` 后回退游标重解，支持分批与断点。起因是切换 ABI 不会回溯重解，存量 3,978 条 `undecodable` 需要它才能安全修正。详见 `docs/SESSION-HANDOFF.md` §8。 |
+| （暂无） | `cmd/redecode/main.go` 已于 2026-11-20 以「离线重解」形态创建，不再需要「删数据 + 拨游标 + 重扫」的路径。 |

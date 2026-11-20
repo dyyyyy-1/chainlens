@@ -4,7 +4,7 @@
 >
 > **冲突处理规则**：本文件与 `HANDOFF.md` 不一致时，**以 `HANDOFF.md` 为准**，并必须把偏离登记到 §5.1。本文件只描述运行状态，不重新定义设计。
 >
-> 最后更新：2026-11-17
+> 最后更新：2026-11-20（交接后第一批）
 
 ---
 
@@ -13,10 +13,11 @@
 W1 / W2 / W3（画像 + HTTP API）/ W4（回放对拍 + README）/ 加固 / 前端，**全部完成并推送**。
 索引器、查询服务、浏览器三个视图都能跑；`cmd/verify` 对拍 783,105 条零差异。
 
-**没有做到一半的活。剩下的都是未开工项，清单在 §7**——`/api/stats` 全表 count、第三方对拍、
-多合约索引、真正的身份体系等，每项都写了现状、影响与阻塞条件。
+**2026-11-20 交接后第一批已完成**（详见 §9）：链上余额（F2）、多口令轮换 + 日志指纹（F1 加固）、
+存量 3,978 条 `undecodable` 离线重解归零（F5）、CI / `.gitattributes` / `LICENSE` / `scripts/check.sh`（O3~O6）。
 
-换会话接手时，先看 §7.5 的四个阻塞决策：那些不是写代码能推进的，需要用户拍板。
+**没有做到一半的活。剩下的都是未开工项，清单在 §7。** §7.5 的四个阻塞决策里，F1 / F2 / F5 已定案，
+只剩 **V1 第三方对拍需要 Etherscan key**（须本人注册）。
 
 ---
 
@@ -99,24 +100,28 @@ GOSUMDB=sum.golang.org GOPROXY=https://goproxy.cn,direct go mod tidy
 
 ## 4. 当前数据状态
 
-`chainlens` 库快照（2026-11-20 14:52，索引器**已随会话结束停机**）：
+`chainlens` 库快照（**2026-11-20 17:24，索引器仍在运行**，数字随时间增长，不要当成定值）：
 
 | 指标 | 值 |
 |---|---|
-| `chain_log` 行数 | 2,858,047 |
-| 已索引区间 | 26422714 .. 26454633（连续，无缺口） |
-| `chain_log` 总大小 | 1043 MB |
-| `decoded_event` | decoded 2,854,336 / undecodable 3,978（存量） |
-| `index_cursor` | `next_block=26454634`，`finalized_block=26454621`，`chain_id=1` |
-| `block_header` | 31,924 行 = 区间块数（连续），其中 `is_finalized=false` 12 行 |
+| `chain_log` 行数 | 2,927,922 |
+| 已索引区间 | 26422714 .. 26455389（连续，无缺口） |
+| `chain_log` 总大小 | 1068 MB |
+| `decoded_event` | decoded 2,927,922 / **undecodable 0**（存量 3,978 条已于 2026-11-20 离线重解） |
+| `index_cursor` | `next_block=26455390`，`finalized_block=26455377`，`chain_id=1` |
+| `block_header` | 32,676 行 = 区间块数（连续），尾部 `is_finalized=false` 约 12 行 |
 | `contract_meta` | USDC，`abi_source=sourcify`，72 条目，implementation `0x4350...02dd` |
-| 事件分布 | Transfer 约占 90%，其余为 Approval / Mint / Burn / AuthorizationUsed / unknown 3,978 |
 
 目标合约：主网 USDC `0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48`，链 ID 1。
 
 索引器按需手动 `go run`，非常驻。追平后停顿会让 `next_block` 落到 publicnode 的约 10,000 块滚动窗口之外，届时会被判成归档请求而失败（§8.5）。
 
-那 3,978 条 `undecodable` 是**内置 ABI 时代的存量**，切 Sourcify 不会回溯重解，见 §8。
+**停机判断必须现测，不要相信本文档的快照。** 2026-11-20 上一版写「已随会话结束停机」，
+实际进程还活着（`go run ./cmd/indexer`，PID 31768）。启动第二个实例会抢游标、烧 RPC 配额：
+
+```bash
+tasklist | grep -i indexer      # 有输出就先别启动
+```
 
 ---
 
@@ -205,11 +210,11 @@ GOSUMDB=sum.golang.org GOPROXY=https://goproxy.cn,direct go mod tidy
 
 | # | 事项 | 现状 | 缺口 / 影响 | 阻塞 |
 |---|---|---|---|---|
-| F1 | 真正的身份体系 | 只有可选静态 token（`API_TOKEN`） | 不能区分调用者、不能单独撤销、无细粒度授权 | 需先定方案（OIDC / API key 表 / 维持现状） |
-| F2 | 真实余额 | 只显示「区间内净变化」 | 用户看到负数会以为出错；真实余额要查 `balanceOf()` | 会给只读服务加一个 RPC 依赖，需决策 |
+| F1 | 真正的身份体系 | ✅ 已定：**维持静态 token**，另加逗号分隔多口令（轮换）+ 日志记 token 指纹 | 仍不能区分调用者身份、不能单独撤销某一个调用方 | 已定案。需要时再上 API key 表，不预先建 |
+| F2 | 真实余额 | ✅ 已做：`/balances` 增 `onchain` 块（`balanceOf` + `decimals`），10s 缓存，失败降级不影响主字段 | 只覆盖 `holdings` 前 5 个合约；只能看「现在」，没有历史余额 | 已定案（可失败设计） |
 | F3 | 多合约索引 | `TARGET_CONTRACT` 只支持单合约 | `/interactions` 恒为一行；画像只覆盖 USDC | 需改配置结构与 API 维度，工作量中等 |
 | F4 | decimals 元数据 | 前端常量按 USDC 6 位换算 | 索引其他代币时金额差 10^N | 需 `contract_meta` 增列 + 接口返回 + 前端改造 |
-| F5 | `cmd/redecode` | 用户明确**暂缓** | 存量 3,978 条 `undecodable` 无法安全修正（需要可断点的区间重解） | 用户点头即可做，做法见 §8 第 1 条 |
+| F5 | `cmd/redecode` | ✅ 已做：**离线重解**（读 `chain_log` → 解码 → 覆盖写 `decoded_event`），3,978 → 0 | 将来新出现的未解码仍需重跑一次（秒级） | 已闭环，原理见 §8 第 1 条 |
 | F6 | 前端深链 | 标签页切换不写 URL | 刷新回到统计页，无法分享「某个地址的画像」 | 无。用 URLSearchParams 或轻量路由即可 |
 | F7 | 事件导出 | 无 | 只能翻页看，不能导出 CSV / JSON | 无 |
 
@@ -226,7 +231,7 @@ GOSUMDB=sum.golang.org GOPROXY=https://goproxy.cn,direct go mod tidy
 
 | # | 事项 | 现状 |
 |---|---|---|
-| V1 | 第三方对拍 | **缺失**。Etherscan 需本人注册 key；Blockscout 在本机不可达。`cmd/verify` 是同源回放，只能证明「索引忠实」，不能证明「语义与第三方一致」 |
+| V1 | 第三方对拍 | **缺失，已拆成两条**：V1a 用独立实现（Python web3 / Node viem + Circle 官方 ABI）解码同一批日志，与库内 `payload` 逐字段比对——**不需要 key**，证明「语义正确」；V1b 对 Etherscan 数据源，需本人注册 key。`cmd/verify` 是同源回放，只能证明「索引忠实」 |
 | V2 | `internal/store` 零测试 | 写路径（COPY + ON CONFLICT、游标推进、reorg 删除）只靠压测与对拍间接验证，没有单测 |
 | V3 | `web/` 零自动化测试 | 无 vitest / RTL，完全靠手测 |
 | V4 | reorg 回归 | `scripts/reorg-test/run.sh` 只在 W2D2 跑过一次，未纳入任何回归流程 |
@@ -237,19 +242,19 @@ GOSUMDB=sum.golang.org GOPROXY=https://goproxy.cn,direct go mod tidy
 |---|---|---|
 | O1 | 索引器非常驻 | 手动 `go run`。停机超过约 1.4 天就滑出 publicnode 窗口，必须走一次补缺口流程（§9「缺口补齐」） |
 | O2 | 补缺口靠手工 | drpc + `BATCH_BLOCK_RANGE=100` + `RPC_HEADER_BATCH=3`，约 40 分钟，可脚本化 |
-| O3 | 无 CI | 未配 GitHub Actions；门禁（build / vet / test / gofumpt + npm lint / build）全靠本地手敲 |
-| O4 | `Makefile` 跑不了 | 本机没装 `make`，命令只能手敲 |
-| O5 | 无 `.gitattributes` | LF/CRLF 警告持续出现，纯 Go + SQL 暂无害 |
-| O6 | 无 `LICENSE` | 仓库是 Public，但未声明许可 |
+| O3 | ~~无 CI~~ | ✅ 已加 `.github/workflows/ci.yml`（gofumpt / build / vet / test + npm ci / lint / build，不连库） |
+| O4 | ~~`Makefile` 跑不了~~ | ✅ 已加 `scripts/check.sh`，与 CI 同一套门禁；Makefile 保留给装了 make 的环境 |
+| O5 | ~~无 `.gitattributes`~~ | ✅ 已加，统一 LF |
+| O6 | ~~无 `LICENSE`~~ | ✅ 已加 MIT。如需 Apache-2.0 / AGPL，改文件即可（已发布提交是可追溯的，但不影响重新授权） |
 
-### 7.5 需要用户拍板的（阻塞项汇总）
+### 7.5 阻塞项（2026-11-20：三件已定案，只剩一件）
 
-1. **F2 真实余额**：是否接受只读服务引入一个 RPC 依赖。
-2. **F1 身份体系**：做不做、做到什么程度（静态 token 已够用于内网）。
-3. **F5 `cmd/redecode`**：此前明确暂缓，何时需要（影响 3,978 条存量未解码）。
-4. **V1 第三方对拍**：能否提供 Etherscan key（须本人注册，不接受代办）。
+1. ~~F2 真实余额~~ → **已定：接**。做成可失败能力（`onchain.enabled`、单条 `status=unavailable`），不是强依赖。
+2. ~~F1 身份体系~~ → **已定：维持静态 token**，加多口令轮换与日志指纹，不建 key 表。
+3. ~~F5 `cmd/redecode`~~ → **已定：离线重解**，已完成，存量归零。
+4. **V1 第三方对拍** —— 仍需你本人注册 Etherscan key（不接受代办）。没有 key 只能做 V1a。
 
-其余各项（F3/F4/F6/F7、P1~P4、V2~V4、O2~O6）**没有阻塞**，按优先级挑着做即可。
+其余各项（F3/F4/F6/F7、P1~P4、V2~V4、O1/O2）**没有阻塞**，按 §7 的顺序挑着做即可。
 
 ### 7.6 已定决策（不要再翻案，除非用户主动提）
 
@@ -263,21 +268,27 @@ GOSUMDB=sum.golang.org GOPROXY=https://goproxy.cn,direct go mod tidy
 - 一个进程只建**一套连接池**：`cmd/api` 用 `store.New` 建池后把 `st.Pool()` 交给 `profile.New`。
 - 前端形态：**Vite + React + TS**，构建产物由 `cmd/api` 同源托管（§5.1 第 14 条）。
 - `/api/events` 同时保留 `cursor` 与 `offset`，两者互斥（§5.1 第 12 条）。
+- **链上余额是可选能力，不是主数据**：未配置 RPC 时 `onchain.enabled=false`；查询失败回 `status=unavailable`，**绝不回 0**。`decimals` 未知时回 `null`，调用方不得猜。
+- **未解码日志的修正只走离线重解**（读 `chain_log` 重解），不再「删 `decoded_event` + 拨游标 + 重扫」——后者要重拉链上日志，而存量早已滑出免费端点窗口。
 
 ## 8. 已知遗留问题
 
 > 功能与工程缺口已全部归入 §7。本节只保留**需要背景解释**的技术遗留，避免两处各写一份。
 
-1. **存量 3,978 条 `undecodable` 未重解**。它们是内置 ABI 时代写入的，切 Sourcify 后新写入的数据未解码率为 0（已验证区间 26426000..26426199：237 → 0）。要全量修正需要：
+1. **存量 3,978 条 `undecodable` 已于 2026-11-20 离线重解归零。**
+   它们全部落在 `26422714..26426427`（2,106 个块），是内置 ABI 时代的存量。按当前 Sourcify ABI 重解后的分布：
+   Mint 1,622 / Burn 1,477 / AuthorizationUsed 877 / Blacklisted 1 / MinterConfigured 1，**0 条失败**。
+
+   **为什么原计划是错的**：旧版写的是「DELETE + 拨游标 + 重跑索引器」。那要重新从链上拉日志，
+   而这段区间早已滑出 publicnode 的 10,000 块窗口，必须切归档端点、按约 2.5 块/秒重扫（3.5 小时起）。
+   实际上原始日志一直躺在 `chain_log` 里，缺的只是「用现在的 ABI 再解一次」——
+   `cmd/redecode` 只读库、不碰游标，8 批秒级完成。
+
+   下面这段 SQL 仅作对照，**不要执行**（它会把游标拨回去，触发一次全量重扫）：
    ```sql
-   DELETE FROM decoded_event
-   WHERE (tx_hash, log_index) IN (
-       SELECT tx_hash, log_index FROM chain_log WHERE block_number BETWEEN $a AND $b
-   );
+   DELETE FROM decoded_event WHERE ...;
    UPDATE index_cursor SET next_block = $a, finalized_block = $a;
    ```
-   然后重跑索引器。**注意 `chain_log` 有主键冲突保护，重扫不会产生重复行**。
-   这件事需要 `cmd/redecode` 才能做得安全（可断点、可分批），用户暂缓。
 
 2. **`Makefile` 跑不了**：本机没装 `make`。命令直接手敲。
 
@@ -419,6 +430,21 @@ W4 之前需要知道的限制：
 
 教训：**免费端点的时间窗口决定了「停机超过一天就等于断档」**。想保持连续历史，索引器要么常驻，要么每次停机后都走一次这套补缺口流程。
 
+### 交接后第一批（✅ 完成 2026-11-20）
+
+1. **F2 链上余额**：`internal/chain/token.go`（手写 selector、**不重试**）+ `internal/api/balance.go`
+   （并发查、余额 10s / decimals 1h 两级缓存、每 256 次写入清理过期项）+ handler 的 `onchain` 块 + 前端余额列。
+   实测 `0x0000...8a90`：净变化 `-7,202,785.433099`，链上余额 `31,727,695.39694`，二次请求 `cached=true`。
+   `RPC_HTTP_URL` 或 `CHAIN_ID` 缺一即自动关闭（`enabled=false`），不影响 API 启动。
+2. **F1 加固**：`API_TOKEN` 支持逗号分隔多口令（轮换用），`tokenFingerprint` 把 SHA-256 前 4 字节写进访问日志。
+3. **F5 离线重解**：`cmd/redecode`，默认 dry-run。写库前先备份到 `decoded_event_undecodable_backup_20261120`（3,978 行），
+   需要回滚时按 `(tx_hash, log_index)` 把备份行写回即可。
+4. **O3~O6**：`.github/workflows/ci.yml`、`scripts/check.sh`、`.gitattributes`、`LICENSE`（MIT）。
+5. **门禁**：`go build / vet / test` 全绿，前端 `lint / build` 通过；`internal/api` 新增 7 个用例
+   （余额未启用 / 正常 / 失败不影响主字段 / 缓存命中 / 缓存过期 / 精度未知 / 指纹不泄漏）。
+
+**遗留的小账**：`Holdings.Net` 仍按 USDC 6 位换算（F4 未做），链上余额已用接口返回的 `decimals`。
+
 ---
 
 ## 10. 常用命令
@@ -428,7 +454,9 @@ cd E:/chainlens
 export PATH="/c/Program Files/PostgreSQL/17/bin:$PATH"
 export PATH="$HOME/.foundry/bin:$PATH"
 
-# 质量门禁
+# 质量门禁（一条命令，与 CI 同一套）
+bash scripts/check.sh
+# 或手敲：
 go build ./... && go vet ./... && go test ./... && ~/go/bin/gofumpt -l .
 
 # 跑索引器（依赖本地 .env，已 gitignore）
@@ -447,6 +475,10 @@ curl -s "localhost:8080/api/address/0x000000000004444c5dc75cb358380d2e3de08a90/b
 
 # 探测某区间的日志布局
 go run ./cmd/probe
+
+# 重解未解码日志（默认 dry-run，只统计不写库）
+go run ./cmd/redecode
+go run ./cmd/redecode -apply -batch 500
 
 # 回放对拍（链上日志 vs 库内日志，逐字段；退出码 0 一致 / 1 有差异 / 2 失败）
 go run ./cmd/verify
