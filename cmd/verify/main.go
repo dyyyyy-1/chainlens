@@ -59,9 +59,18 @@ func main() {
 func run() int {
 	from := flag.Uint64("from", 0, "起始区块，缺省取库内最早区块")
 	to := flag.Uint64("to", 0, "结束区块，缺省取库内最新区块")
-	batch := flag.Uint64("batch", defaultBatch, "每批核对的区块数，上限 2000")
+	batch := flag.Uint64("batch", defaultBatch, "每批核对的区块数，上限 2000（仅 rpc 模式）")
 	contractFlag := flag.String("contract", "", "目标合约地址，缺省取 .env 的 TARGET_CONTRACT")
+	source := flag.String("source", "rpc", "数据源：rpc（链上 JSON-RPC，可全量）或 etherscan（第三方 API，抽样）")
+	segments := flag.Uint64("segments", 20, "etherscan 模式的抽样段数")
+	width := flag.Uint64("width", 3, "etherscan 模式每段的区块数；单段日志数必须小于 1000")
+	proxy := flag.String("proxy", "", "etherscan 模式的 HTTP 代理（如 http://127.0.0.1:10808）；缺省沿用环境变量")
 	flag.Parse()
+
+	if *source != "rpc" && *source != "etherscan" {
+		fmt.Fprintf(os.Stderr, "未知的 -source %q，只支持 rpc 或 etherscan\n", *source)
+		return 2
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -95,17 +104,6 @@ func run() int {
 	}
 	defer st.Close()
 
-	client, err := chain.New(ctx, cfg.RPCHTTPURL, cfg.ChainID, chain.Options{
-		// 与索引器读同一个配置：用 drpc 核对补缺口那段数据时，
-		// 块头批量必须降到 3，否则对拍工具自己会先失败。
-		HeaderBatchSize: int(cfg.RPCHeaderBatch),
-	})
-	if err != nil {
-		slog.Error("verify failed", "stage", "rpc", "err", err)
-		return 2
-	}
-	defer client.Close()
-
 	coverage, err := st.Coverage(ctx)
 	if err != nil {
 		slog.Error("verify failed", "stage", "coverage", "err", err)
@@ -121,6 +119,24 @@ func run() int {
 		fmt.Fprintln(os.Stderr, err)
 		return 2
 	}
+
+	// etherscan 模式不碰 RPC：不建 chain.Client，也不需要探测归档窗口——
+	// 它验证的正是「换个数据源，结论是否仍然成立」。
+	if *source == "etherscan" {
+		return runEtherscan(ctx, cfg, st, address, start, end, *proxy,
+			etherscanOptions{segments: *segments, width: *width})
+	}
+
+	client, err := chain.New(ctx, cfg.RPCHTTPURL, cfg.ChainID, chain.Options{
+		// 与索引器读同一个配置：用 drpc 核对补缺口那段数据时，
+		// 块头批量必须降到 3，否则对拍工具自己会先失败。
+		HeaderBatchSize: int(cfg.RPCHeaderBatch),
+	})
+	if err != nil {
+		slog.Error("verify failed", "stage", "rpc", "err", err)
+		return 2
+	}
+	defer client.Close()
 
 	head, err := client.LatestBlockNumber(ctx)
 	if err != nil {
