@@ -94,16 +94,16 @@ GOSUMDB=sum.golang.org GOPROXY=https://goproxy.cn,direct go mod tidy
 
 ## 4. 当前数据状态
 
-`chainlens` 库快照（2026-11-19 13:55，索引器**运行中**）：
+`chainlens` 库快照（2026-11-20 12:10，索引器**运行中**）：
 
 | 指标 | 值 |
 |---|---|
-| `chain_log` 行数 | 2,102,518 |
-| 已索引区间 | 26422714 .. 26447172（连续，无缺口） |
-| `chain_log` 总大小 | 773 MB |
-| `decoded_event` | decoded 2,098,540 / undecodable 3,978（存量） |
-| `index_cursor` | `next_block=26447173`，`finalized_block=26447160`，`chain_id=1` |
-| `block_header` | 24,459 行 = 区间块数（连续），其中 `is_finalized=false` 12 行 |
+| `chain_log` 行数 | 2,793,986 |
+| 已索引区间 | 26422714 .. 26453825（连续，无缺口） |
+| `chain_log` 总大小 | 1020 MB |
+| `decoded_event` | decoded 2,790,008 / undecodable 3,978（存量） |
+| `index_cursor` | `next_block=26453826`，`finalized_block=26453813`，`chain_id=1` |
+| `block_header` | 31,112 行 = 区间块数（连续），其中 `is_finalized=false` 12 行 |
 | `contract_meta` | USDC，`abi_source=sourcify`，72 条目，implementation `0x4350...02dd` |
 | 事件分布 | Transfer 约占 90%，其余为 Approval / Mint / Burn / AuthorizationUsed / unknown 3,978 |
 

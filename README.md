@@ -132,15 +132,18 @@ curl -s "localhost:8080/api/address/0x000000000004444c5dc75cb358380d2e3de08a90/b
 | 存储 | 38.3 万条日志 → `chain_log` 147 MB + `decoded_event` 113 MB（约 680 B/条） |
 | 新数据未解码率 | 0%（Sourcify ABI） |
 
-查询延迟（库内 210 万条日志、24,459 块，最热地址 5.7 万条 Transfer）：
+查询延迟（库内 279 万条日志、31,112 块，最热地址 5.7 万条 Transfer）：
 
 | 端点 | 耗时 |
 |---|---|
-| `/api/events?limit=50` | 3 ms |
-| `/api/address/{a}/approvals` | 156 ms |
-| `/api/address/{a}/interactions` | 154 ms |
-| `/api/address/{a}/balances` | 296 ms |
-| `/api/stats` | 353 ms（首次）/ <1 ms（10 秒缓存内） |
+| `/api/events?limit=50` | 2 ms |
+| `/api/address/{a}/approvals` | 160 ms |
+| `/api/address/{a}/interactions` | 172 ms |
+| `/api/address/{a}/balances` | 287 ms |
+| `/api/stats` | 360 ms（首次）/ <1 ms（10 秒缓存内） |
+
+首次调用会明显偏高（`balances` 冷启动实测 866 ms），因为聚合要读的堆页还没进缓存；
+上表取热态值。
 
 比对记录与完整基准见 [`docs/BENCHMARK.md`](docs/BENCHMARK.md)。
 
@@ -247,10 +250,10 @@ curl -s "localhost:8080/api/address/0x000000000004444c5dc75cb358380d2e3de08a90/b
 
 ## 局限（请先读这一段）
 
-1. **只覆盖一段区间。** 当前库内约 2.45 万块（26,422,714..26,447,172）。因此「持仓」是净变化、「授权」是区间内快照，**都不能直接当链上当前状态用**。
+1. **只覆盖一段区间。** 当前库内约 3.11 万块（26,422,714..26,453,825）。因此「持仓」是净变化、「授权」是区间内快照，**都不能直接当链上当前状态用**。
 2. **没有第三方交叉验证。** Etherscan API 需要 key（本项目不接受代注册），Blockscout 在开发机上不可达。现有的对拍是**同源回放**：用 `cmd/verify` 重新拉同一区间的 `eth_getLogs`，与库内逐字段比对（19 批 / 783,105 条 / 0 差异）。它能证明索引器忠实记录，**不能**证明我们对合约语义的理解与第三方一致。
 3. **免费端点的归档窗口约 10,000 块且滚动。** 索引器停机过久，`next_block` 会滑出窗口，`eth_getLogs` 报 `Archive requests require a personal token`，需要把 `START_BLOCK` 与游标回拨到窗口内。
-4. **`/api/stats` 的计数是全表聚合**，随数据量线性变慢（当前 84.9 万行约 176 ms）。已加 10 秒进程内缓存挡住重复请求，但没有解决复杂度；全量索引 USDC 后仍需计数表或物化视图。
+4. **`/api/stats` 的计数是全表聚合**，随数据量线性变慢（84.9 万行 176 ms → 279 万行 360 ms，约线性）。已加 10 秒进程内缓存挡住重复请求，但没有解决复杂度；全量索引 USDC 后仍需计数表或物化视图。
 5. **鉴权是可选的静态共享密钥**（`API_TOKEN`），默认关闭。它能回答「调用方是否知道口令」，
    但不能区分调用者、不能单独撤销、也没有细粒度授权。要这些能力需要真正的认证服务。
 6. `/api/events` 已支持键集分页；为兼容旧调用保留了 `offset`，深翻页会退化，建议改用 `cursor`。
