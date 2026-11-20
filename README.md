@@ -31,12 +31,17 @@ psql "postgres://chainlens@localhost:5432/chainlens" -f migrations/0002_decoded_
 cp .env.example .env
 # 至少填 DATABASE_URL 与 TARGET_CONTRACT
 
-# 3. 索引（前台运行，Ctrl-C 优雅退出）
+# 3. 前端（可选；构建后由 cmd/api 直接托管）
+cd web && npm install && npm run build && cd ..
+
+# 4. 索引（前台运行，Ctrl-C 优雅退出）
 go run ./cmd/indexer
 
-# 4. 查询服务（另开一个终端）
+# 5. 查询服务（另开一个终端）
 go run ./cmd/api
 ```
+
+打开 <http://localhost:8080/> 即界面；API 在同一端口下：
 
 ```bash
 curl -s localhost:8080/api/stats
@@ -58,6 +63,7 @@ curl -s "localhost:8080/api/address/0x000000000004444c5dc75cb358380d2e3de08a90/b
 | `HTTP_ADDR` | 查询服务监听地址，默认 `:8080` |
 | `HTTP_RATE_LIMIT` | 每 IP 每分钟请求上限，默认 120；0 关闭 |
 | `API_TOKEN` | 非空时要求 `Authorization: Bearer <token>`；留空不鉴权 |
+| `WEB_DIR` | 前端构建产物目录，默认 `web/dist`；目录不存在则不托管前端 |
 
 ---
 
@@ -248,6 +254,40 @@ curl -s "localhost:8080/api/address/0x000000000004444c5dc75cb358380d2e3de08a90/b
 
 ---
 
+## 前端
+
+`web/` 是 Vite + React + TypeScript 写的一页式界面，构建产物由 `cmd/api` 直接托管
+（`GET /` 交给静态文件，`/api/*` 之外的路径回退到 `index.html`）。这样部署仍然只有
+一个二进制与一个数据库，不需要另起静态服务器或配跨域。
+
+三个视图：
+
+| 视图 | 内容 |
+|---|---|
+| 索引统计 | 日志总数、已解码/未解码占比、已索引块数、数据新鲜度 |
+| 地址画像 | 代币净变化、授权（标注无限额度）、交互合约，各表附一条语义说明 |
+| 事件检索 | 按合约与区块区间过滤，游标翻页，参数按事件类型压成一行 |
+
+开发时用 Vite 自己起服务，`/api` 由 `vite.config.ts` 代理到 `localhost:8080`：
+
+```bash
+cd web
+npm run dev      # http://localhost:5173
+```
+
+界面上有两处刻意的「不美化」：
+
+- **金额不做浮点转换**。接口返回的是十进制字符串，前端按 6 位小数用字符串切分格式化，
+  全程不经过 `Number`。48 位的 USDC 数额若走浮点会静默丢精度。
+- **语义边界直接写在表格下方**。持仓是「已索引区间内的净变化」而不是余额、授权是
+  「区间内最新一条日志」而不是当前 allowance——这两句话如果只写在 README 里，
+  看界面的人照样会误读。
+
+已知短板：`is_unlimited` 由后端判定，但金额小数位是前端常量（按 USDC 的 6 位）。
+索引其他代币时需要把小数位一起接进接口，否则显示会差 10^N。
+
+---
+
 ## 局限（请先读这一段）
 
 1. **只覆盖一段区间。** 当前库内约 3.11 万块（26,422,714..26,453,825）。因此「持仓」是净变化、「授权」是区间内快照，**都不能直接当链上当前状态用**。
@@ -257,6 +297,7 @@ curl -s "localhost:8080/api/address/0x000000000004444c5dc75cb358380d2e3de08a90/b
 5. **鉴权是可选的静态共享密钥**（`API_TOKEN`），默认关闭。它能回答「调用方是否知道口令」，
    但不能区分调用者、不能单独撤销、也没有细粒度授权。要这些能力需要真正的认证服务。
 6. `/api/events` 已支持键集分页；为兼容旧调用保留了 `offset`，深翻页会退化，建议改用 `cursor`。
+7. **前端按 USDC 的 6 位小数格式化金额**。索引其他代币时需要让接口返回 decimals，否则显示差 10^N。
 
 ---
 

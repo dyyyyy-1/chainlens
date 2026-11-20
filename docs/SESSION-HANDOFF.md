@@ -88,7 +88,7 @@ GOSUMDB=sum.golang.org GOPROXY=https://goproxy.cn,direct go mod tidy
 | W3D3 | HTTP API（5 个端点）+ `cmd/api` | ✅ 完成 |
 | W4 | 回放对拍（`cmd/verify`）、README、BENCHMARK 重测 | ✅ 完成 |
 | 加固 | 事件键集分页、按 IP 限流、stats 计数缓存 | ✅ 完成 |
-| W4+ | 前端 `web/`（`HANDOFF` §9 标为可选） | ⬜ **未开始，待决定** |
+| 前端 | `web/`：Vite + React + TS，三个视图，由 `cmd/api` 同源托管 | ✅ 完成 |
 
 ---
 
@@ -144,6 +144,7 @@ GOSUMDB=sum.golang.org GOPROXY=https://goproxy.cn,direct go mod tidy
 | 11 | §5 进程入口只有 `cmd/indexer`（W3D3 已增 `cmd/api`） | 再加 `cmd/verify`（回放对拍） | 对拍是 W4 的验收手段，需要独立进程与退出码；写成 shell 脚本就无法复用 `chain` 的重试语义与 `store` 的类型 | 用户确认（W4 范围选定「对拍 + README」） |
 | 12 | §7 `GET /api/events` 只有 `offset` | 增加 `cursor`（键集分页），`offset` 保留兼容；两者互斥，同时给出报 400 | `OFFSET` 让数据库先数过前面所有行，翻得越深越慢；静默取其一会让客户端分页悄悄错位 | 用户确认（先做加固） |
 | 13 | 加固方案原定「stats 计数表」 | 改为 **10 秒进程内 TTL 缓存** | 计数表要在「批提交事务」与「reorg 回滚」两处同时维护，任何一处漏改都会让统计静默漂移且难以发现；缓存的失效方式是过期，不会积累错误 | 用户确认（改选 TTL 缓存） |
+| 14 | §4 架构图只有 `web (React)`，未定形态 | 用 Vite + React + TS，构建产物由 `cmd/api` 托管（`/api/*` 之外回退 index.html） | 保持「一个二进制 + 一个数据库」的部署形态；不托管就得另起静态服务并处理跨域 | 用户选型确认 |
 
 补充说明（第 4 条）：ADR-3 的原始理由是"为全量地址预计算持仓成本极高"。查本地库**不做预计算**、不建聚合表、不建缓存表，只有查询，因此与该理由不冲突。查询侧的硬约束是用户另行提出的："必须有过滤、禁止全量扫描"，落实为 `LIMIT` + `statement_timeout` + 地址左填充 32 字节。
 
@@ -195,7 +196,7 @@ GOSUMDB=sum.golang.org GOPROXY=https://goproxy.cn,direct go mod tidy
 | 事项 | 现状 | 需要谁定 |
 |---|---|---|
 | `cmd/redecode`（按区间重解、可断点续跑） | 用户明确**暂不需要**，记录在案 | 用户 |
-| W4+ 是否做前端（`web/`） | HANDOFF §9 规划为可选，未开工。API 已就绪（5 个端点 + `coverage`），前端可直接接 | 用户 |
+| 前端真实余额展示 | 当前只显示「区间内净变化」。要显示余额需接 RPC `balanceOf`，会让只读服务多一个外部依赖 | 用户 |
 | 是否补第三方对拍 | Etherscan 需本人注册 key；Blockscout 在本机不可达。当前只有同源回放对拍，**不能证明语义与第三方一致** | 用户 |
 
 **已定的决策**（不要再翻案，除非用户主动提）：
@@ -299,7 +300,29 @@ W4 之前需要知道的限制：
 - `/api/stats` 的计数是 `count(*)` 全表聚合，全量索引 USDC 后会变成秒级，届时要改计数表或物化视图（与「不预计算」约束冲突，需要重新权衡）。
 - 无鉴权、无限流，只适合本机或内网。
 
-### W4 —— 收尾（✅ 对拍与 README 已完成 2026-11-17；前端未做）
+### 前端（✅ 完成 2026-11-20）
+
+`web/`：Vite 8 + React 19 + TypeScript 7，无 UI 框架、无状态库、无路由库（三个标签页用状态切换）。
+构建产物由 `cmd/api` 同源托管，`/api/*` 之外的路径回退 `index.html`，部署仍是「一个二进制 + 一个数据库」。
+
+| 视图 | 内容 |
+|---|---|
+| 索引统计 | 日志总数、已解码/未解码、已索引块数、数据新鲜度 |
+| 地址画像 | 净变化 / 授权（无限额度标签）/ 交互合约，三张表各带一条语义说明 |
+| 事件检索 | 合约与区间过滤、游标翻页、参数按事件类型压成一行 |
+
+三条刻意的设计：
+
+1. **金额全程字符串**。uint256 超出 `Number.MAX_SAFE_INTEGER`，前端按 6 位小数用字符串切分格式化，不经过 `Number`。
+2. **语义边界写在表格下面**，不只写在 README。持仓是「区间内净变化」、授权是「区间内最新日志」——看界面的人不会去翻 README。
+3. **`/api/*` 的未匹配路径不回退到 index.html**，返回 JSON 404。否则客户端会拿到 200 + HTML，把「接口不存在」误读成「接口返回异常」。这条有测试守着。
+
+验证：`npm run build` 通过（tsc 严格模式 + Vite 构建，产物 236 KB / gzip 74 KB）；用浏览器实测三个视图的渲染与交互；
+`internal/api` 新增 6 个静态托管用例（含 SPA 回退、`/api` 隔离、路径穿越）。
+
+**已知短板**：金额小数位是前端常量（按 USDC 6 位）。索引其他代币时需要让接口返回 decimals。
+
+### W4 —— 收尾（✅ 对拍与 README 已完成 2026-11-17）
 
 产出：`cmd/verify/main.go`（回放对拍）、`README.md`、`docs/BENCHMARK.md` 第 9~10 节（重测与对拍记录），以及 `store.LogsByRange`（对拍用的区间读取）。
 
@@ -359,6 +382,12 @@ go build ./... && go vet ./... && go test ./... && ~/go/bin/gofumpt -l .
 
 # 跑索引器（依赖本地 .env，已 gitignore）
 go run ./cmd/indexer
+
+# 前端：开发模式（Vite 起在 5173，/api 代理到 8080）
+cd web && npm install && npm run dev
+
+# 前端：构建（产物 web/dist 由 cmd/api 托管）
+cd web && npm run build
 
 # 跑查询服务（默认 :8080，HTTP_ADDR 可覆盖）
 go run ./cmd/api

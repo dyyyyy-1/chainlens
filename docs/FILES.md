@@ -106,6 +106,7 @@ PostgreSQL 的 `COPY` 协议不支持 `ON CONFLICT`，而 §8.4 同时要求「C
 |---|---|---|
 | `router.go` | 路由（5 个端点）、`EventStore` / `ProfileReader` 两个窄接口、请求中间件（超时预算、panic 恢复、访问日志、状态码记录）、按 IP 限流的接线。 | W3D3、加固 |
 | `handlers.go` | 参数解析与校验（含键集游标）、错误映射（超时 → 503、内部错误 → 500 且不泄露 SQL）、响应 DTO 与 `coverage` 封装、hex 与时间格式化。 | W3D3、加固 |
+| `static.go` | 托管前端构建产物并做 SPA 回退。`/api/*` 的未匹配路径**不回退**到 index.html，而是返回 JSON 404——否则客户端会拿到 200 + HTML，把「接口不存在」误读成「接口返回了奇怪的东西」。路径先 `path.Clean` 再拼接，防止穿越。 | 前端 |
 | `auth.go` | 可选的 Bearer token 校验：`API_TOKEN` 非空时启用，空则完全不介入。定长比较避免泄漏前缀匹配长度；方案名大小写不敏感。**这是静态共享密钥，不是身份体系。** | 加固 |
 | `stats_cache.go` | 给 `/api/stats` 的计数加 10 秒进程内缓存（只包 `Stats`，不包事件检索与覆盖区间）。持有互斥锁完成查询，顺带做单飞，避免并发打进来时多个请求同时做全表聚合。错误不进缓存。 | 加固 |
 | `ratelimit.go` | 按来源 IP 的固定窗口限流，缺省 120 次/分钟，`0` 关闭。限流表设容量上限并清理过期条目。**刻意不读 `X-Forwarded-For`**：本服务没有可信代理，该头可被伪造。 | 加固 |
@@ -135,6 +136,25 @@ PostgreSQL 的 `COPY` 协议不支持 `ON CONFLICT`，而 §8.4 同时要求「C
 **migration 不可重复执行**：重跑 `0001` 会因表已存在而失败。本地重建用 `make db-reset`。版本追踪表留到 W2 再定。
 
 ---
+
+## 前端（`web/`）
+
+| 文件 | 职责 |
+|---|---|
+| `web/package.json` | 依赖与脚本。React 19 + Vite 8 + TypeScript，无 UI 框架、无状态库。 |
+| `web/vite.config.ts` | 开发期把 `/api` 代理到 `127.0.0.1:8080`；生产由 `cmd/api` 同源托管，不需要代理。 |
+| `web/src/api.ts` | 与后端 DTO 一一对应的类型与请求封装。金额字段一律 `string`，禁止转 `number`。`ApiError` 保留后端错误码，便于界面区分参数错与超时。 |
+| `web/src/format.ts` | 金额与地址格式化。**全程字符串运算**：uint256 超出 `Number.MAX_SAFE_INTEGER`，转 number 是不可逆的精度丢失。 |
+| `web/src/App.tsx` | 顶栏、三个标签页、token 输入（存 localStorage）。改 token 时以 token 为 key 重新挂载，自动按新凭据重取。 |
+| `web/src/components/StatsPanel.tsx` | 索引统计。指标卡 + 覆盖区间 + 数据新鲜度。 |
+| `web/src/components/AddressProfile.tsx` | 地址画像。三个表（净变化 / 授权 / 交互），各表下方写明语义边界。 |
+| `web/src/components/EventExplorer.tsx` | 事件检索。过滤 + 游标翻页；参数按事件类型（Transfer / Approval / 其他）压成一行。 |
+| `web/src/components/CoverageBar.tsx` | 覆盖区间条。空结果必须能区分「确实没有记录」与「这段历史还没索引」。 |
+| `web/src/styles.css` | 暗色设计系统（CSS 变量、卡片、表格、语义标签）。无第三方样式库。 |
+
+**为什么不用 UI 框架**：三个视图、两张表、若干输入框，手写 CSS 足以覆盖；引入组件库会带来版本跟进与主题覆盖成本，且页面风格要贴合「终端工具」而非「后台管理系统」。
+
+**已知短板**：金额小数位是前端常量（按 USDC 6 位）。索引其他代币时需让接口返回 decimals。
 
 ## 工程配置
 
@@ -173,5 +193,4 @@ PostgreSQL 的 `COPY` 协议不支持 `ON CONFLICT`，而 §8.4 同时要求「C
 
 | 文件 | 里程碑 / 状态 |
 |---|---|
-| `web/` | W4（前端） |
 | `cmd/redecode/main.go` | **用户明确暂缓**。用途：按区间删除 `decoded_event` 后回退游标重解，支持分批与断点。起因是切换 ABI 不会回溯重解，存量 3,978 条 `undecodable` 需要它才能安全修正。详见 `docs/SESSION-HANDOFF.md` §8。 |
