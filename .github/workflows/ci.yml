@@ -1,0 +1,65 @@
+name: ci
+
+# 门禁与本地 scripts/check.sh 保持一致：Go 侧 build / vet / test / gofumpt，
+# 前端侧 lint / build。测试不连数据库——internal/profile 的集成测试
+# 需要 CHAINLENS_TEST_DSN，CI 不设置它，会按设计跳过。
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: gofumpt
+        run: |
+          go install mvdan.cc/gofumpt@v0.12.0
+          unformatted="$(gofumpt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "以下文件需要 gofumpt 重排："
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: build
+        run: go build ./...
+
+      - name: vet
+        run: go vet ./...
+
+      - name: test
+        run: go test ./...
+
+  web:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: install
+        run: npm ci
+
+      - name: lint
+        run: npm run lint
+
+      - name: build
+        run: npm run build
