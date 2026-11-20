@@ -74,6 +74,7 @@ func run() error {
 		Logger:             slog.Default(),
 		RateLimitPerMinute: int(cfg.HTTPRateLimit),
 		APIToken:           cfg.APIToken,
+		WebDir:             cfg.WebDir,
 	})
 
 	server := &http.Server{
@@ -81,6 +82,12 @@ func run() error {
 		Handler:           handler,
 		ReadHeaderTimeout: readHeaderTimeout,
 		IdleTimeout:       idleTimeout,
+	}
+
+	if cfg.WebDir == "" {
+		slog.Info("frontend not served", "hint", "npm run build 后重试，或用 WEB_DIR 指定目录")
+	} else {
+		slog.Info("frontend served", "dir", cfg.WebDir)
 	}
 
 	serveErr := make(chan error, 1)

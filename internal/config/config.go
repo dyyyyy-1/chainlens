@@ -32,6 +32,8 @@ type Config struct {
 	HTTPRateLimit uint64
 	// APIToken 非空时查询服务要求 Bearer token，仅 cmd/api 使用。
 	APIToken string
+	// WebDir 是前端构建产物目录，仅 cmd/api 使用。为空表示不托管前端。
+	WebDir string
 }
 
 // .env 模板中的缺省值，仅在对应环境变量为空时生效。
@@ -41,6 +43,7 @@ const (
 	defaultHeaderBatch     = 100
 	defaultHTTPAddr        = ":8080"
 	defaultRateLimit       = 120
+	defaultWebDir          = "web/dist"
 )
 
 // Load 先读取 envFile（可为空串或不存在），再从进程环境变量解析配置。
@@ -109,6 +112,14 @@ func LoadServer(envFile string) (Config, error) {
 		DatabaseURL: os.Getenv("DATABASE_URL"),
 		HTTPAddr:    httpAddr(),
 		APIToken:    strings.TrimSpace(os.Getenv("API_TOKEN")),
+		WebDir:      strings.TrimSpace(os.Getenv("WEB_DIR")),
+	}
+	if cfg.WebDir == "" {
+		cfg.WebDir = defaultWebDir
+	}
+	// 目录不存在时关闭托管，避免每个请求都去 stat 一个不存在的路径。
+	if info, statErr := os.Stat(cfg.WebDir); statErr != nil || !info.IsDir() {
+		cfg.WebDir = ""
 	}
 
 	var err error

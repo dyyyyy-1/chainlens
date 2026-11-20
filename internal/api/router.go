@@ -46,6 +46,8 @@ type Deps struct {
 	RateLimitPerMinute int
 	// APIToken 非空时要求 Bearer token；为空表示不启用鉴权。
 	APIToken string
+	// WebDir 非空时在该目录托管前端构建产物（web/dist），并做 SPA 回退。
+	WebDir string
 }
 
 // NewRouter 组装路由与中间件。
@@ -64,6 +66,10 @@ func NewRouter(d Deps) http.Handler {
 	mux.HandleFunc("GET /api/address/{addr}/approvals", d.handleApprovals)
 	mux.HandleFunc("GET /api/address/{addr}/interactions", d.handleInteractions)
 	mux.HandleFunc("GET /api/stats", d.handleStats)
+
+	if d.WebDir != "" {
+		mux.Handle("GET /", staticHandler(d.WebDir))
+	}
 
 	handler := authRequired(d.APIToken, mux)
 	return d.observe(rateLimited(newRateLimiter(d.RateLimitPerMinute), handler))
