@@ -57,6 +57,7 @@ curl -s "localhost:8080/api/address/0x000000000004444c5dc75cb358380d2e3de08a90/b
 | `RPC_HEADER_BATCH` | 单次批量请求的块头数，默认 100。publicnode 允许 100，drpc 免费档只允许 3 |
 | `HTTP_ADDR` | 查询服务监听地址，默认 `:8080` |
 | `HTTP_RATE_LIMIT` | 每 IP 每分钟请求上限，默认 120；0 关闭 |
+| `API_TOKEN` | 非空时要求 `Authorization: Bearer <token>`；留空不鉴权 |
 
 ---
 
@@ -234,6 +235,7 @@ curl -s "localhost:8080/api/address/0x000000000004444c5dc75cb358380d2e3de08a90/b
 | 400 | `invalid_address` / `invalid_contract` / `invalid_range` / `invalid_limit` / `invalid_offset` / `invalid_cursor` | 参数不合法 |
 | 400 | `conflicting_pagination` | `cursor` 与 `offset` 同时给出 |
 | 405 | — | 非 GET 请求 |
+| 401 | `unauthorized` | 启用了 `API_TOKEN` 但缺少或携带错误的 Bearer token |
 | 429 | `rate_limited` | 超出按 IP 的请求速率，响应带 `Retry-After` |
 | 503 | `query_timeout` | 查询超出时间预算，缩小地址或区间后重试 |
 | 500 | `internal` | 内部错误，细节只进日志 |
@@ -249,7 +251,8 @@ curl -s "localhost:8080/api/address/0x000000000004444c5dc75cb358380d2e3de08a90/b
 2. **没有第三方交叉验证。** Etherscan API 需要 key（本项目不接受代注册），Blockscout 在开发机上不可达。现有的对拍是**同源回放**：用 `cmd/verify` 重新拉同一区间的 `eth_getLogs`，与库内逐字段比对（19 批 / 783,105 条 / 0 差异）。它能证明索引器忠实记录，**不能**证明我们对合约语义的理解与第三方一致。
 3. **免费端点的归档窗口约 10,000 块且滚动。** 索引器停机过久，`next_block` 会滑出窗口，`eth_getLogs` 报 `Archive requests require a personal token`，需要把 `START_BLOCK` 与游标回拨到窗口内。
 4. **`/api/stats` 的计数是全表聚合**，随数据量线性变慢（当前 84.9 万行约 176 ms）。已加 10 秒进程内缓存挡住重复请求，但没有解决复杂度；全量索引 USDC 后仍需计数表或物化视图。
-5. **无鉴权**，只适合本机或内网。有限流（按 IP 固定窗口），但限流不等于鉴权。
+5. **鉴权是可选的静态共享密钥**（`API_TOKEN`），默认关闭。它能回答「调用方是否知道口令」，
+   但不能区分调用者、不能单独撤销、也没有细粒度授权。要这些能力需要真正的认证服务。
 6. `/api/events` 已支持键集分页；为兼容旧调用保留了 `offset`，深翻页会退化，建议改用 `cursor`。
 
 ---
