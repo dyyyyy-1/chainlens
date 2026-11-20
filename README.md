@@ -316,7 +316,7 @@ npm run dev      # http://localhost:5173
 ## 局限（请先读这一段）
 
 1. **只覆盖一段区间。** 当前库内约 3.27 万块（26,422,714..26,455,389，随索引器推进）。因此「净变化」是区间内累加、「授权」是区间内快照，**都不能直接当链上当前状态用**。链上余额（`onchain`）不受此限，但它是实时值，不是历史快照。
-2. **没有第三方交叉验证。** Etherscan API 需要 key（本项目不接受代注册），Blockscout 在开发机上不可达。现有的对拍是**同源回放**：用 `cmd/verify` 重新拉同一区间的 `eth_getLogs`，与库内逐字段比对（19 批 / 783,105 条 / 0 差异）。它能证明索引器忠实记录，**不能**证明我们对合约语义的理解与第三方一致。
+2. **第三方交叉验证只覆盖抽样。** `cmd/verify -source etherscan` 走 Etherscan V2 抽样 24 段 / 9,773 条，与库内逐字段比对（含 `block_time`），0 差异；另有同源全量回放（19 批 / 783,105 条 / 0 差异）。抽样证明「在样本上与第三方一致」，不等于全量一致——免费档单次最多 1,000 条且有日限额。实测还发现 Etherscan 对个别日志返回空 `logIndex`（`"0x"`），这类条目按 `(tx, topics, data)` 在库内唯一匹配后计入比对，匹配不上的会计入 missing，不会被静默跳过。
 3. **免费端点的归档窗口约 10,000 块且滚动。** 索引器停机过久，`next_block` 会滑出窗口，`eth_getLogs` 报 `Archive requests require a personal token`，需要把 `START_BLOCK` 与游标回拨到窗口内。
 4. **`/api/stats` 的计数是全表聚合**，随数据量线性变慢（84.9 万行 176 ms → 279 万行 360 ms，约线性）。已加 10 秒进程内缓存挡住重复请求，但没有解决复杂度；全量索引 USDC 后仍需计数表或物化视图。
 5. **鉴权是可选的静态共享密钥**（`API_TOKEN`），默认关闭。它能回答「调用方是否知道口令」，
@@ -331,21 +331,32 @@ npm run dev      # http://localhost:5173
 ## 验证工具
 
 ```bash
-# 区间回放对拍：链上日志 vs 库内日志，逐字段（含 block_time）
+# 同源回放：链上 JSON-RPC vs 库内日志，逐字段（含 block_time）
 # 退出码 0 无差异 / 1 有差异 / 2 运行失败
 go run ./cmd/verify
 
 # 只核对最近 500 块
 go run ./cmd/verify -from 26432530 -to 26433029 -batch 500
+
+# 第三方抽样对拍：Etherscan V2 作为独立数据源
+# 需要 .env 里的 ETHERSCAN_API_KEY；本机需要代理时加 -proxy
+go run ./cmd/verify -source etherscan -segments 24 -width 5 -proxy http://127.0.0.1:10808
 ```
 
-工具会自动二分探测归档边界，只核对可回放的部分，不会把「超出窗口」误报成「数据缺失」。
+rpc 模式会自动二分探测归档边界，只核对可回放的部分，不会把「超出窗口」误报成「数据缺失」。
+
+etherscan 模式按 `-segments × -width` 均匀抽样：单段日志数必须小于 1000（免费档上限，
+触到上限会报错而不是静默截断），因此宁可多段、窄段。默认 3 次/秒限速。
 
 ---
 
 ## 开发
 
 ```bash
+# 一条命令，与 CI 同一套（CI 见 .github/workflows/ci.yml）
+bash scripts/check.sh
+
+# 等价手敲
 go build ./... && go vet ./... && go test ./... && gofumpt -l .
 ```
 

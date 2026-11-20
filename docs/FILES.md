@@ -15,6 +15,8 @@
 | `cmd/api/main.go` | 查询服务入口。装载配置 → **只建一个连接池**（`store.New`）→ `profile.New(st.Pool())` 复用同一个池 → 启动 `http.Server` 并处理优雅退出。含 `ReadHeaderTimeout` / `IdleTimeout` / `Shutdown` 三项超时。 | W3D3 |
 | `cmd/verify/main.go` | 回放对拍工具。对同一区间重新 `eth_getLogs`，与 `chain_log` 按 `(tx_hash, log_index)` 逐字段比对（含 `block_time`），报告缺失/多余/不一致。**运行时二分探测归档边界**，只核对可回放部分，不把「超出窗口」误报成「数据缺失」。退出码 0/1/2。 | W4 |
 | `cmd/verify/main_test.go` | 证明比对函数**能发现差异**（缺失 / 多余 / data 改动 / 块时间漂移），以及区间收敛的边界。没有这组用例，「0 差异」的结论不可信。 | W4 |
+| `cmd/verify/etherscan.go` | `-source etherscan`：把 Etherscan V2 的 `getLogs` 作为**独立数据源**做抽样对拍，复用 `diffBatch`。数值字段兼容 hex 与十进制；3 次/秒限速；单次触到 1000 条上限直接报错（免费档会静默截断）。`sampleRanges` 负责均匀抽样。`reconcileIndexless` 处理第三方返回空 `logIndex` 的条目：按 `(tx, topics, data)` 唯一匹配，零候选计 missing，多候选报错而不是猜。 | 交接后（2026-11-20） |
+| `cmd/verify/etherscan_test.go` | `parseQuantity` / `isBlankQuantity` / `sampleRanges` / `reconcileIndexless` 的表驱动测试，含「多候选必须报错」「空 logIndex 不得退化成 0」两条边界。 | 交接后（2026-11-20） |
 | `cmd/redecode/main.go` | **离线重解**存量 `undecodable` 日志：从 `chain_log` 读原始日志、用 `contract_meta` 里的 ABI 重解、按块区间分批覆盖写 `decoded_event`。**不访问 RPC、不碰 `index_cursor`、不改 `chain_log`**，因此与索引器可并存。默认 dry-run，`-apply` 才写库。 | 交接后（2026-11-20） |
 
 ---

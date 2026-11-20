@@ -14,10 +14,11 @@ W1 / W2 / W3（画像 + HTTP API）/ W4（回放对拍 + README）/ 加固 / 前
 索引器、查询服务、浏览器三个视图都能跑；`cmd/verify` 对拍 783,105 条零差异。
 
 **2026-11-20 交接后第一批已完成**（详见 §9）：链上余额（F2）、多口令轮换 + 日志指纹（F1 加固）、
-存量 3,978 条 `undecodable` 离线重解归零（F5）、CI / `.gitattributes` / `LICENSE` / `scripts/check.sh`（O3~O6）。
+存量 3,978 条 `undecodable` 离线重解归零（F5）、CI / `.gitattributes` / `LICENSE` / `scripts/check.sh`（O3~O6）、
+Etherscan 第三方抽样对拍 24 段 / 9,773 条 0 差异（V1b）。
 
-**没有做到一半的活。剩下的都是未开工项，清单在 §7。** §7.5 的四个阻塞决策里，F1 / F2 / F5 已定案，
-只剩 **V1 第三方对拍需要 Etherscan key**（须本人注册）。
+**§7.5 的四个阻塞决策已全部解开**，没有等待用户输入的事项。
+**没有做到一半的活。剩下的都是未开工项，清单在 §7。**
 
 ---
 
@@ -231,7 +232,7 @@ tasklist | grep -i indexer      # 有输出就先别启动
 
 | # | 事项 | 现状 |
 |---|---|---|
-| V1 | 第三方对拍 | **缺失，已拆成两条**：V1a 用独立实现（Python web3 / Node viem + Circle 官方 ABI）解码同一批日志，与库内 `payload` 逐字段比对——**不需要 key**，证明「语义正确」；V1b 对 Etherscan 数据源，需本人注册 key。`cmd/verify` 是同源回放，只能证明「索引忠实」 |
+| V1 | 第三方对拍 | ✅ **V1b 已完成**：`cmd/verify -source etherscan` 抽样 24 段 / 9,773 条，与库内逐字段比对（含 `block_time`），0 差异。发现 Etherscan 对个别日志返回空 `logIndex`，已按 `(tx, topics, data)` 唯一匹配处理。V1a（独立解码实现比对 `payload`）仍未做——它验证的是「解码语义」，V1b 验证的是「数据源一致」，两者不互相替代 |
 | V2 | `internal/store` 零测试 | 写路径（COPY + ON CONFLICT、游标推进、reorg 删除）只靠压测与对拍间接验证，没有单测 |
 | V3 | `web/` 零自动化测试 | 无 vitest / RTL，完全靠手测 |
 | V4 | reorg 回归 | `scripts/reorg-test/run.sh` 只在 W2D2 跑过一次，未纳入任何回归流程 |
@@ -252,7 +253,7 @@ tasklist | grep -i indexer      # 有输出就先别启动
 1. ~~F2 真实余额~~ → **已定：接**。做成可失败能力（`onchain.enabled`、单条 `status=unavailable`），不是强依赖。
 2. ~~F1 身份体系~~ → **已定：维持静态 token**，加多口令轮换与日志指纹，不建 key 表。
 3. ~~F5 `cmd/redecode`~~ → **已定：离线重解**，已完成，存量归零。
-4. **V1 第三方对拍** —— 仍需你本人注册 Etherscan key（不接受代办）。没有 key 只能做 V1a。
+4. ~~V1 第三方对拍~~ → **已解**：key 已配置并验证（`module=stats&action=ethsupply` 返回 OK），V1b 抽样对拍 0 差异。V1a（独立解码实现）不依赖 key，仍未做。
 
 其余各项（F3/F4/F6/F7、P1~P4、V2~V4、O1/O2）**没有阻塞**，按 §7 的顺序挑着做即可。
 
@@ -443,6 +444,14 @@ W4 之前需要知道的限制：
 5. **门禁**：`go build / vet / test` 全绿，前端 `lint / build` 通过；`internal/api` 新增 7 个用例
    （余额未启用 / 正常 / 失败不影响主字段 / 缓存命中 / 缓存过期 / 精度未知 / 指纹不泄漏）。
 
+6. **V1b 第三方对拍**：`cmd/verify -source etherscan`，24 段 × 5 块 / 9,773 条，0 差异。
+   过程中发现两件必须记住的事：
+   - **免费档单次上限 1,000 条**（2026-07-01 起），触到上限会静默截断，所以代码里主动判定并报错。
+   - **Etherscan 会对个别日志返回空 `logIndex`**（实测块 26433620 / 26433621 各一条，`transactionIndex` 同样为空）。
+     这些记录 topics/data 完整，库里也都在。处理方式是按 `(tx, topics, data)` 唯一匹配，
+     匹配不上计入 missing，多候选直接报错——**不能丢弃**，否则会掩盖真正的数据缺失。
+   - 本机 `HTTPS_PROXY` 指向的端口可能是死的（本次是 53451），实际可用的是 10808；代理端口每次要现测。
+
 **遗留的小账**：`Holdings.Net` 仍按 USDC 6 位换算（F4 未做），链上余额已用接口返回的 `decimals`。
 
 ---
@@ -483,6 +492,9 @@ go run ./cmd/redecode -apply -batch 500
 # 回放对拍（链上日志 vs 库内日志，逐字段；退出码 0 一致 / 1 有差异 / 2 失败）
 go run ./cmd/verify
 go run ./cmd/verify -from 26432530 -to 26433029 -batch 500
+
+# 第三方抽样对拍（Etherscan V2；需 ETHERSCAN_API_KEY，代理端口要现测）
+go run ./cmd/verify -source etherscan -segments 24 -width 5 -proxy http://127.0.0.1:10808
 
 # reorg 端到端验证（用独立库，不碰开发库）
 bash scripts/reorg-test/run.sh
