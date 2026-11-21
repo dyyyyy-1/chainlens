@@ -37,12 +37,15 @@ USDC="0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
 REORG_DEPTH=5
 TRANSFER_AMOUNT="1000000" # 1 USDC（6 位小数）
 
-# 最小 ERC-20：任何调用都 emit Transfer(from=0, to=calldata[4:36], value=calldata[36:68]) 并返回 true。
+# 最小 ERC-20（77 字节）：按 calldata 长度分两条路径。
+#   calldata == 4 字节（decimals()）  → 返回 6
+#   其他（transfer，68 字节）         → emit Transfer(from=0, to=calldata[4:36], value=calldata[36:68])，返回 true
 #
 # 为什么需要它：local 模式没有主网状态，而索引器只关心「目标合约产生了匹配的日志」。
-# 与其在 CI 里下载 solc 编译一个测试合约，不如注入这段 59 字节的 runtime——
-# 它不校验 selector、不维护余额，只负责产生一条合法的 Transfer 日志。
-MINIMAL_ERC20="0x60243560005260043560007fddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef60206000a3600160005260206000f3"
+# 与其在 CI 里下载 solc 编译测试合约，不如注入这段 runtime——它不维护余额，
+# 但保留 decimals() 分支，这样 contract_meta.decimals 在本地也走真实链路。
+# 把 0x6012 替换 0x6006 就是 18 位的变体（验证多合约不同精度时用）。
+MINIMAL_ERC20="0x3660041460425760243560005260043560007fddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef60206000a3600160005260206000f35b600660005260206000f3"
 
 case "$MODE" in
 local)

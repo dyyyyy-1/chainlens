@@ -115,11 +115,14 @@ type DecodedRecord struct {
 // ContractMeta 是 contract_meta 一行在内存中的形态。
 //
 // Implementation 为 nil 表示识别结果不是代理；ABI 为 nil 表示尚未获取。
+// Decimals 为 nil 表示还没取到——它必须与「0 位小数」区分开，否则前端会把
+// 未知当成整数型代币显示。
 type ContractMeta struct {
 	Address        common.Address
 	Implementation *common.Address
 	ABI            []byte
 	ABISource      string
+	Decimals       *uint8
 	ResolvedAt     time.Time
 }
 

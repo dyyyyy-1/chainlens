@@ -60,7 +60,7 @@ func run() int {
 	from := flag.Uint64("from", 0, "起始区块，缺省取库内最早区块")
 	to := flag.Uint64("to", 0, "结束区块，缺省取库内最新区块")
 	batch := flag.Uint64("batch", defaultBatch, "每批核对的区块数，上限 2000（仅 rpc 模式）")
-	contractFlag := flag.String("contract", "", "目标合约地址，缺省取 .env 的 TARGET_CONTRACT")
+	contractFlag := flag.String("contract", "", "只核对指定合约；缺省核对配置里的全部合约")
 	source := flag.String("source", "rpc", "数据源：rpc（链上 JSON-RPC，可全量）或 etherscan（第三方 API，抽样）")
 	segments := flag.Uint64("segments", 20, "etherscan 模式的抽样段数")
 	width := flag.Uint64("width", 3, "etherscan 模式每段的区块数；单段日志数必须小于 1000")
@@ -87,15 +87,23 @@ func run() int {
 		return 2
 	}
 
-	contract := cfg.TargetContract
+	targets := cfg.TargetContracts
 	if *contractFlag != "" {
-		contract = *contractFlag
+		targets = []string{*contractFlag}
 	}
-	if !common.IsHexAddress(contract) {
-		fmt.Fprintf(os.Stderr, "无效的合约地址 %q\n", contract)
+	if len(targets) == 0 {
+		fmt.Fprintln(os.Stderr, "没有目标合约：设置 TARGET_CONTRACTS（或 TARGET_CONTRACT），或用 -contract 指定")
 		return 2
 	}
-	address := common.HexToAddress(contract)
+
+	addresses := make([]common.Address, 0, len(targets))
+	for _, target := range targets {
+		if !common.IsHexAddress(target) {
+			fmt.Fprintf(os.Stderr, "无效的合约地址 %q\n", target)
+			return 2
+		}
+		addresses = append(addresses, common.HexToAddress(target))
+	}
 
 	st, err := store.New(ctx, cfg.DatabaseURL)
 	if err != nil {
@@ -123,8 +131,16 @@ func run() int {
 	// etherscan 模式不碰 RPC：不建 chain.Client，也不需要探测归档窗口——
 	// 它验证的正是「换个数据源，结论是否仍然成立」。
 	if *source == "etherscan" {
-		return runEtherscan(ctx, cfg, st, address, start, end, *proxy,
-			etherscanOptions{segments: *segments, width: *width})
+		// 每个合约单独抽样：不同合约的日志密度差很多，混在一起会让「单段 < 1000 条」的
+		// 约束随合约数量变得难以估计。
+		exitCode := 0
+		for _, address := range addresses {
+			if code := runEtherscan(ctx, cfg, st, address, start, end, *proxy,
+				etherscanOptions{segments: *segments, width: *width}); code > exitCode {
+				exitCode = code
+			}
+		}
+		return exitCode
 	}
 
 	client, err := chain.New(ctx, cfg.RPCHTTPURL, cfg.ChainID, chain.Options{
@@ -146,7 +162,8 @@ func run() int {
 
 	fmt.Printf("库内区间 %d..%d，链头 %d\n", start, end, head)
 
-	boundary, err := oldestServable(ctx, client, start, end, address)
+	// 归档窗口是端点属性，与合约无关：用第一个合约探一次即可。
+	boundary, err := oldestServable(ctx, client, start, end, addresses[0])
 	if err != nil {
 		slog.Error("verify failed", "stage", "probe archive window", "err", err)
 		return 2
@@ -162,7 +179,21 @@ func run() int {
 
 	fmt.Printf("开始核对 %d..%d，每批 %d 块\n", start, end, *batch)
 
-	result := verifyRange(ctx, st, client, address, start, end, *batch)
+	var result result
+	for _, address := range addresses {
+		batchResult := verifyRange(ctx, st, client, address, start, end, *batch)
+		result.batches += batchResult.batches
+		result.chainCount += batchResult.chainCount
+		result.dbCount += batchResult.dbCount
+		result.missing += batchResult.missing
+		result.extra += batchResult.extra
+		result.mismatch += batchResult.mismatch
+		result.timeMismatch += batchResult.timeMismatch
+		result.failed = result.failed || batchResult.failed
+		if batchResult.failed {
+			break
+		}
+	}
 	printSummary(result)
 
 	if result.ok() {
@@ -187,7 +218,7 @@ func verifyRange(
 	for from := start; from <= end; from += batch {
 		to := min(from+batch-1, end)
 
-		chainLogs, err := client.Fetch(ctx, from, to, address)
+		chainLogs, err := client.Fetch(ctx, from, to, []common.Address{address})
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "拉取 %d..%d 失败：%v\n", from, to, err)
 			total.failed = true
@@ -395,7 +426,7 @@ func resolveRange(from, to uint64, coverage store.Coverage) (uint64, uint64, err
 // 所以用二分探测：先用单块请求确认两端，再二分收敛。每个探针只有一次轻量请求。
 func oldestServable(ctx context.Context, client *chain.Client, from, to uint64, address common.Address) (uint64, error) {
 	probe := func(height uint64) (bool, error) {
-		_, err := client.Fetch(ctx, height, height, address)
+		_, err := client.Fetch(ctx, height, height, []common.Address{address})
 		if err == nil {
 			return true, nil
 		}

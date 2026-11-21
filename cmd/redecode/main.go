@@ -74,11 +74,13 @@ func run(apply bool, from, to, batch uint64) error {
 	if cfg.DatabaseURL == "" {
 		return errors.New("redecode: DATABASE_URL is required")
 	}
-	if cfg.TargetContract == "" {
-		return errors.New("redecode: TARGET_CONTRACT is required (用它定位 contract_meta 里的 ABI)")
+	if len(cfg.TargetContracts) == 0 {
+		return errors.New("redecode: TARGET_CONTRACTS（或 TARGET_CONTRACT）is required，用它定位 contract_meta 里的 ABI")
 	}
-	if !common.IsHexAddress(cfg.TargetContract) {
-		return fmt.Errorf("redecode: invalid TARGET_CONTRACT %q", cfg.TargetContract)
+	for _, raw := range cfg.TargetContracts {
+		if !common.IsHexAddress(raw) {
+			return fmt.Errorf("redecode: invalid contract address %q", raw)
+		}
 	}
 
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: cfg.LogLevel})))
@@ -89,57 +91,22 @@ func run(apply bool, from, to, batch uint64) error {
 	}
 	defer st.Close()
 
-	contract := common.HexToAddress(cfg.TargetContract)
-
-	summary, err := st.UndecodableSummary(ctx)
-	if err != nil {
-		return err
-	}
-	fmt.Printf("存量未解码：%d 条，涉及 %d 个块，区间 %d..%d\n",
-		summary.Rows, summary.Blocks, summary.MinBlock, summary.MaxBlock)
-
-	if summary.Rows == 0 {
-		fmt.Println("没有需要重解的日志，退出。")
-		return nil
-	}
-
-	// 区间缺省取存量的最小/最大块号：把扫描范围收敛到真正需要处理的地方。
-	if from == 0 {
-		from = summary.MinBlock
-	}
-	if to == 0 {
-		to = summary.MaxBlock
-	}
-
-	dec, err := loadDecoder(ctx, st, contract)
-	if err != nil {
-		return err
-	}
-
 	if !apply {
 		fmt.Println("模式：dry-run（不写库）。加 -apply 才会覆盖 decoded_event。")
 	} else {
 		fmt.Println("模式：apply（覆盖写 decoded_event，不修改 chain_log 与 index_cursor）")
 	}
-	fmt.Printf("扫描区间 %d..%d，每批 %d 块\n", from, to, batch)
+	fmt.Printf("每批 %d 块\n", batch)
 
-	stats, err := redecodeRange(ctx, st, dec, from, to, batch, apply)
-	if err != nil {
-		return err
+	for _, raw := range cfg.TargetContracts {
+		if err := redecodeContract(ctx, st, common.HexToAddress(raw), apply, from, to, batch); err != nil {
+			return err
+		}
 	}
 
-	fmt.Printf("\n汇总：扫描 %d 条，可解 %d 条，仍不可解 %d 条\n",
-		stats.Scanned, stats.Decoded, stats.StillUndecodable)
 	if !apply {
 		fmt.Println("dry-run 未写库。确认数字合理后加 -apply 重跑。")
-		return nil
 	}
-
-	after, err := st.UndecodableSummary(ctx)
-	if err != nil {
-		return err
-	}
-	fmt.Printf("写库后存量未解码：%d 条（原 %d 条）\n", after.Rows, summary.Rows)
 	return nil
 }
 
@@ -163,6 +130,60 @@ func loadDecoder(ctx context.Context, st *store.Store, contract common.Address) 
 	return dec, nil
 }
 
+// redecodeContract 重解单个合约的存量未解码日志。
+//
+// 按合约分开是必须的：每个合约的 ABI 不同，拿 USDC 的 ABI 去解另一个代币的日志，
+// 结果只会是「全部 undecodable」，看起来像重解失败。
+func redecodeContract(
+	ctx context.Context,
+	st *store.Store,
+	contract common.Address,
+	apply bool,
+	from, to, batch uint64,
+) error {
+	summary, err := st.UndecodableSummary(ctx, contract)
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("\n%s：存量未解码 %d 条，涉及 %d 个块，区间 %d..%d\n",
+		contract.Hex(), summary.Rows, summary.Blocks, summary.MinBlock, summary.MaxBlock)
+	if summary.Rows == 0 {
+		return nil
+	}
+
+	if from == 0 {
+		from = summary.MinBlock
+	}
+	if to == 0 {
+		to = summary.MaxBlock
+	}
+
+	dec, err := loadDecoder(ctx, st, contract)
+	if err != nil {
+		return err
+	}
+
+	stats, err := redecodeRange(ctx, st, dec, contract, from, to, batch, apply)
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("%s 汇总：扫描 %d 条，可解 %d 条，仍不可解 %d 条\n",
+		contract.Hex(), stats.Scanned, stats.Decoded, stats.StillUndecodable)
+
+	if !apply {
+		return nil
+	}
+
+	after, err := st.UndecodableSummary(ctx, contract)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("%s 写库后存量未解码：%d 条（原 %d 条）\n", contract.Hex(), after.Rows, summary.Rows)
+	return nil
+}
+
 // redecodeStats 汇总一次重解的计数。
 type redecodeStats struct {
 	Scanned          int
@@ -178,6 +199,7 @@ func redecodeRange(
 	ctx context.Context,
 	st *store.Store,
 	dec *decoder.Decoder,
+	contract common.Address,
 	from, to, batch uint64,
 	apply bool,
 ) (redecodeStats, error) {
@@ -190,7 +212,7 @@ func redecodeRange(
 
 		end := min(start+batch-1, to)
 
-		records, err := st.UndecodableLogs(ctx, start, end)
+		records, err := st.UndecodableLogs(ctx, start, end, contract)
 		if err != nil {
 			return stats, err
 		}

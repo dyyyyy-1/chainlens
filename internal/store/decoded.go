@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/jackc/pgx/v5"
 )
 
@@ -116,7 +117,8 @@ SELECT count(*),
        coalesce(max(cl.block_number), 0)
 FROM decoded_event de
 JOIN chain_log cl ON cl.tx_hash = de.tx_hash AND cl.log_index = de.log_index
-WHERE de.status <> 'decoded'`
+WHERE de.status <> 'decoded'
+  AND cl.contract = $1`
 
 // UndecodableSummary 是存量未解码日志的分布概况。
 type UndecodableSummary struct {
@@ -126,10 +128,13 @@ type UndecodableSummary struct {
 	MaxBlock uint64
 }
 
-// UndecodableSummary 返回未解码日志的条数、涉及块数与块号区间。
-func (s *Store) UndecodableSummary(ctx context.Context) (UndecodableSummary, error) {
+// UndecodableSummary 返回某个合约未解码日志的条数、涉及块数与块号区间。
+//
+// 按合约统计而不是全表：多合约索引后每个合约的 ABI 不同，
+// 「用谁的 ABI 重解」必须先按合约分开，否则会把一个合约的日志交给另一个的 ABI。
+func (s *Store) UndecodableSummary(ctx context.Context, contract common.Address) (UndecodableSummary, error) {
 	var summary UndecodableSummary
-	if err := s.pool.QueryRow(ctx, undecodableSummarySQL).Scan(
+	if err := s.pool.QueryRow(ctx, undecodableSummarySQL, contract.Bytes()).Scan(
 		&summary.Rows, &summary.Blocks, &summary.MinBlock, &summary.MaxBlock,
 	); err != nil {
 		return UndecodableSummary{}, fmt.Errorf("store: undecodable summary: %w", err)
@@ -147,17 +152,18 @@ FROM chain_log cl
 JOIN decoded_event de ON de.tx_hash = cl.tx_hash AND de.log_index = cl.log_index
 WHERE de.status <> 'decoded'
   AND cl.block_number BETWEEN $1 AND $2
+  AND cl.contract = $3
 ORDER BY cl.block_number, cl.log_index`
 
-// UndecodableLogs 返回闭区间内未解码的原始日志，按 (block_number, log_index) 升序。
+// UndecodableLogs 返回闭区间内某合约未解码的原始日志，按 (block_number, log_index) 升序。
 //
 // 调用方必须自己控制区间宽度：这是可能一次返回大量行的查询，与 LogsByRange 同理。
-func (s *Store) UndecodableLogs(ctx context.Context, from, to uint64) ([]LogRecord, error) {
+func (s *Store) UndecodableLogs(ctx context.Context, from, to uint64, contract common.Address) ([]LogRecord, error) {
 	if from > to {
 		return nil, fmt.Errorf("store: invalid block range %d..%d", from, to)
 	}
 
-	rows, err := s.pool.Query(ctx, undecodableLogsSQL, int64(from), int64(to))
+	rows, err := s.pool.Query(ctx, undecodableLogsSQL, int64(from), int64(to), contract.Bytes())
 	if err != nil {
 		return nil, fmt.Errorf("store: undecodable logs %d..%d: %w", from, to, err)
 	}

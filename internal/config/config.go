@@ -18,7 +18,11 @@ type Config struct {
 	RPCHTTPURL      string
 	EtherscanAPIKey string
 	ChainID         uint64
-	TargetContract  string
+	// TargetContracts 是索引目标，至少一个。
+	//
+	// TARGET_CONTRACTS（逗号分隔）优先；为空时回退到单值写法 TARGET_CONTRACT，
+	// 保证旧 .env 与脚本不用改。
+	TargetContracts []string
 	StartBlock      uint64
 	Confirmations   uint64
 	BatchBlockRange uint64
@@ -63,7 +67,7 @@ func Load(envFile string) (Config, error) {
 		DatabaseURL:     os.Getenv("DATABASE_URL"),
 		RPCHTTPURL:      strings.TrimSpace(os.Getenv("RPC_HTTP_URL")),
 		EtherscanAPIKey: os.Getenv("ETHERSCAN_API_KEY"),
-		TargetContract:  strings.TrimSpace(os.Getenv("TARGET_CONTRACT")),
+		TargetContracts: parseContracts(os.Getenv("TARGET_CONTRACTS"), os.Getenv("TARGET_CONTRACT")),
 		HTTPAddr:        httpAddr(),
 	}
 	if cfg.RPCHTTPURL == "" {
@@ -116,9 +120,9 @@ func LoadServer(envFile string) (Config, error) {
 		HTTPAddr:    httpAddr(),
 		APITokens:   splitTokens(os.Getenv("API_TOKEN")),
 		WebDir:      strings.TrimSpace(os.Getenv("WEB_DIR")),
-		// TARGET_CONTRACT 只有 cmd/redecode 用到（按合约取 ABI），查询服务本身不读它。
+		// cmd/redecode 用它按合约取 ABI；查询服务本身不读它。
 		// 集中在这里解析，避免各命令各自 os.Getenv 出一套不一致的默认值。
-		TargetContract: strings.TrimSpace(os.Getenv("TARGET_CONTRACT")),
+		TargetContracts: parseContracts(os.Getenv("TARGET_CONTRACTS"), os.Getenv("TARGET_CONTRACT")),
 		// 链上余额是可选能力：只配置其中一个变量不足以安全调用 RPC
 		// （chain 层要靠 CHAIN_ID 拒绝主网与测试网混用），因此两者缺一即视为未启用。
 		RPCHTTPURL: strings.TrimSpace(os.Getenv("RPC_HTTP_URL")),
@@ -198,6 +202,17 @@ func unquote(value string) string {
 		return value[1 : len(value)-1]
 	}
 	return value
+}
+
+// parseContracts 解析合约列表：多值写法优先，回退到单值写法。
+//
+// 两种情况共用 splitTokens 的切分规则（去空白、去空项、保序去重）：
+// 重复的合约会让索引器对同一份日志做两次解码，虽然结果相同，但白白浪费 ABI 解析与 RPC。
+func parseContracts(multi, single string) []string {
+	if strings.TrimSpace(multi) != "" {
+		return splitTokens(multi)
+	}
+	return splitTokens(single)
 }
 
 // splitTokens 把逗号分隔的口令串切成列表，去掉空白与空项并按首次出现去重。

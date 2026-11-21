@@ -681,7 +681,7 @@ func TestUndecodableSummaryAndLogs(t *testing.T) {
 		t.Fatalf("提交失败：%v", err)
 	}
 
-	summary, err := st.UndecodableSummary(ctx)
+	summary, err := st.UndecodableSummary(ctx, testContract)
 	if err != nil {
 		t.Fatalf("UndecodableSummary 失败：%v", err)
 	}
@@ -689,7 +689,7 @@ func TestUndecodableSummaryAndLogs(t *testing.T) {
 		t.Fatalf("summary = %+v, want 1 条 / 1 块 / 100..100", summary)
 	}
 
-	logs, err := st.UndecodableLogs(ctx, 100, 100)
+	logs, err := st.UndecodableLogs(ctx, 100, 100, testContract)
 	if err != nil {
 		t.Fatalf("UndecodableLogs 失败：%v", err)
 	}
@@ -701,8 +701,32 @@ func TestUndecodableSummaryAndLogs(t *testing.T) {
 	}
 
 	// 已解码的行不能被选中，否则重解会做无意义的覆盖写。
-	if got, err := st.UndecodableLogs(ctx, 105, 105); err != nil || len(got) != 0 {
+	if got, err := st.UndecodableLogs(ctx, 105, 105, testContract); err != nil || len(got) != 0 {
 		t.Fatalf("已解码区间应返回空，得到 %d 条 err=%v", len(got), err)
+	}
+
+	// 多合约隔离：另一个合约的未解码日志不能被算进来。
+	// 拿 A 的 ABI 去解 B 的日志只会得到「全部 undecodable」，看起来像重解失败。
+	other := common.HexToAddress("0x1111111111111111111111111111111111111111")
+	otherLog := sampleLog(100, 4, 0)
+	otherLog.Contract = other
+
+	tx2 := mustTx(t, st)
+	if _, err := st.InsertLogs(ctx, tx2, []LogRecord{otherLog}); err != nil {
+		t.Fatalf("写入其他合约日志失败：%v", err)
+	}
+	if _, err := st.InsertDecoded(ctx, tx2, []DecodedRecord{sampleDecoded(4, 0, "undecodable")}); err != nil {
+		t.Fatalf("写入其他合约解码结果失败：%v", err)
+	}
+	if err := tx2.Commit(ctx); err != nil {
+		t.Fatalf("提交失败：%v", err)
+	}
+
+	if summary, err := st.UndecodableSummary(ctx, testContract); err != nil || summary.Rows != 1 {
+		t.Fatalf("按合约统计应仍为 1 条，得到 %+v err=%v", summary, err)
+	}
+	if got, err := st.UndecodableLogs(ctx, 100, 100, other); err != nil || len(got) != 1 {
+		t.Fatalf("其他合约应只返回 1 条，得到 %d 条 err=%v", len(got), err)
 	}
 }
 

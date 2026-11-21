@@ -17,7 +17,8 @@ import (
 
 // LogFetcher 由索引器声明、由 internal/chain 实现（接口定义在使用方，HANDOFF.md 第 11 节）。
 type LogFetcher interface {
-	Fetch(ctx context.Context, from, to uint64, addr common.Address) ([]types.Log, error)
+	// Fetch 一次拉取多个合约在同一区间内的日志。
+	Fetch(ctx context.Context, from, to uint64, addresses []common.Address) ([]types.Log, error)
 }
 
 // HeaderFetcher 提供块头与链头高度。
@@ -48,30 +49,41 @@ type EventDecoder interface {
 
 // Config 是索引器运行参数，取自 HANDOFF.md 第 10 节的环境变量。
 type Config struct {
-	ChainID       uint64
-	Contract      common.Address
+	ChainID uint64
+	// Contracts 是索引目标集合，至少一个。多合约共享同一个游标与扫描区间。
+	Contracts     []common.Address
 	StartBlock    uint64
 	Confirmations uint64
 	BatchBlocks   uint64
 	PollInterval  time.Duration
 }
 
+// Decoders 是按合约分发的解码器集合。
+//
+// 每个合约的 ABI 不同，必须按日志的 Address 选解码器；用错 ABI 不会报错，
+// 只会把事件解成 undecodable 或解出错误字段，属于静默错误。
+type Decoders struct {
+	ByContract map[common.Address]EventDecoder
+	// Fallback 用于没有专属 ABI 的合约（理论上不该发生：契约集合来自同一份配置）。
+	Fallback EventDecoder
+}
+
 // Scanner 驱动索引主循环。
 type Scanner struct {
-	logs    LogFetcher
-	headers HeaderFetcher
-	store   LogStore
-	decoder EventDecoder
-	cfg     Config
-	logger  *slog.Logger
+	logs     LogFetcher
+	headers  HeaderFetcher
+	store    LogStore
+	decoders Decoders
+	cfg      Config
+	logger   *slog.Logger
 }
 
 // New 构造索引器。logger 为 nil 时回落到 slog 默认实例。
-func New(logs LogFetcher, headers HeaderFetcher, st LogStore, dec EventDecoder, cfg Config, logger *slog.Logger) *Scanner {
+func New(logs LogFetcher, headers HeaderFetcher, st LogStore, decs Decoders, cfg Config, logger *slog.Logger) *Scanner {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Scanner{logs: logs, headers: headers, store: st, decoder: dec, cfg: cfg, logger: logger}
+	return &Scanner{logs: logs, headers: headers, store: st, decoders: decs, cfg: cfg, logger: logger}
 }
 
 // Run 持续扫描直到 ctx 结束。
@@ -137,7 +149,7 @@ func (s *Scanner) scanOnce(ctx context.Context) error {
 
 	started := time.Now()
 
-	rawLogs, err := s.logs.Fetch(ctx, blockRange.From, blockRange.To, s.cfg.Contract)
+	rawLogs, err := s.logs.Fetch(ctx, blockRange.From, blockRange.To, s.cfg.Contracts)
 	if err != nil {
 		return err
 	}
@@ -232,7 +244,7 @@ func (s *Scanner) decodeAll(rawLogs []types.Log) ([]store.DecodedRecord, int) {
 	undecoded := 0
 
 	for _, raw := range rawLogs {
-		event := s.decoder.Decode(raw)
+		event := s.decoderFor(raw.Address).Decode(raw)
 		if !event.IsDecoded() {
 			undecoded++
 			s.logUndecoded(raw, event)
@@ -249,6 +261,31 @@ func (s *Scanner) decodeAll(rawLogs []types.Log) ([]store.DecodedRecord, int) {
 	return records, undecoded
 }
 
+// decoderFor 按合约地址取解码器；未知合约回落到 fallback，而不是 panic。
+func (s *Scanner) decoderFor(address common.Address) EventDecoder {
+	if dec, ok := s.decoders.ByContract[address]; ok {
+		return dec
+	}
+	if s.decoders.Fallback != nil {
+		return s.decoders.Fallback
+	}
+	// 兜底再退一层：空实现，所有日志都会记为 undecodable。
+	// 宁可少解，也不能因为配置缺项让整批扫描崩掉。
+	return undecodableDecoder{}
+}
+
+// undecodableDecoder 把任何日志都标记为 undecodable。
+type undecodableDecoder struct{}
+
+func (undecodableDecoder) Decode(entry types.Log) decoder.Event {
+	return decoder.Event{
+		TxHash:   entry.TxHash,
+		LogIndex: uint32(entry.Index),
+		Status:   "undecodable",
+		Reason:   "no decoder configured for contract",
+	}
+}
+
 // logUndecoded 按原因分级记录。
 //
 // 「ABI 里没有这个事件」是常态——绝大多数合约只把少数事件写进我们手上的 ABI——
@@ -256,6 +293,7 @@ func (s *Scanner) decodeAll(rawLogs []types.Log) ([]store.DecodedRecord, int) {
 func (s *Scanner) logUndecoded(raw types.Log, event decoder.Event) {
 	attributes := []any{
 		"tx", raw.TxHash.Hex(),
+		"contract", raw.Address.Hex(),
 		"log_index", raw.Index,
 		"topics", len(raw.Topics),
 		"data_len", len(raw.Data),

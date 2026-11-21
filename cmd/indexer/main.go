@@ -75,34 +75,54 @@ func run() error {
 	}
 	defer client.Close()
 
-	contract := common.HexToAddress(cfg.TargetContract)
-
-	// 代理识别 + ABI 拉取只在启动时做一次，结果写入 contract_meta。
-	// 任何一步失败都只降级、不中断索引：日志本身不依赖 ABI（HANDOFF.md 8.3）。
-	abiJSON, abiSource := resolveContract(ctx, st, client, decoder.NewSourcifyClient(abiFetchTimeout), cfg.ChainID, contract, logger)
-
-	dec, err := decoder.New(abiJSON)
-	if err != nil {
-		logger.Warn("abi unusable, falling back to builtin ERC20", "abi_source", abiSource, "err", err)
-		abiSource = abiSourceFallback
-		if dec, err = decoder.New([]byte(decoder.ERC20ABI)); err != nil {
-			return fmt.Errorf("indexer: build decoder: %w", err)
-		}
+	contracts := make([]common.Address, 0, len(cfg.TargetContracts))
+	for _, raw := range cfg.TargetContracts {
+		contracts = append(contracts, common.HexToAddress(raw))
 	}
-	logger.Info("decoder ready", "abi_source", abiSource)
+
+	// 每个合约各做一次代理识别 + ABI 拉取 + decimals，结果写入 contract_meta。
+	// 任何一步失败都只降级、不中断索引：日志本身不依赖 ABI（HANDOFF.md 8.3）。
+	sourcify := decoder.NewSourcifyClient(abiFetchTimeout)
+	decoders := make(map[common.Address]indexer.EventDecoder, len(contracts))
+
+	for _, contract := range contracts {
+		abiJSON, abiSource := resolveContract(ctx, st, client, sourcify, cfg.ChainID, contract, logger)
+
+		dec, err := decoder.New(abiJSON)
+		if err != nil {
+			logger.Warn("abi unusable, falling back to builtin ERC20",
+				"contract", contract.Hex(), "abi_source", abiSource, "err", err)
+			abiSource = abiSourceFallback
+			if dec, err = decoder.New([]byte(decoder.ERC20ABI)); err != nil {
+				return fmt.Errorf("indexer: build decoder for %s: %w", contract.Hex(), err)
+			}
+		}
+		logger.Info("decoder ready", "contract", contract.Hex(), "abi_source", abiSource)
+		decoders[contract] = dec
+	}
+
+	// 兜底解码器：配置里出现的合约一定有专属 ABI，但日志的 Address 理论上有可能是
+	// 代理转发路径上的其他地址，缺兜底会 panic 或漏解。
+	fallback, err := decoder.New([]byte(decoder.ERC20ABI))
+	if err != nil {
+		return fmt.Errorf("indexer: build fallback decoder: %w", err)
+	}
 
 	logger.Info("indexer started",
 		"chain_id", cfg.ChainID,
-		"contract", cfg.TargetContract,
+		"contracts", len(contracts),
 		"start_block", cfg.StartBlock,
 		"confirmations", cfg.Confirmations,
 		"batch_blocks", cfg.BatchBlockRange,
 		"header_batch", cfg.RPCHeaderBatch,
 	)
 
-	scanner := indexer.New(client, client, st, dec, indexer.Config{
+	scanner := indexer.New(client, client, st, indexer.Decoders{
+		ByContract: decoders,
+		Fallback:   fallback,
+	}, indexer.Config{
 		ChainID:       cfg.ChainID,
-		Contract:      contract,
+		Contracts:     contracts,
 		StartBlock:    cfg.StartBlock,
 		Confirmations: cfg.Confirmations,
 		BatchBlocks:   cfg.BatchBlockRange,
@@ -117,11 +137,13 @@ func validate(cfg config.Config) error {
 	if cfg.DatabaseURL == "" {
 		return errors.New("indexer: DATABASE_URL is required")
 	}
-	if cfg.TargetContract == "" {
-		return errors.New("indexer: TARGET_CONTRACT is required")
+	if len(cfg.TargetContracts) == 0 {
+		return errors.New("indexer: TARGET_CONTRACTS (or TARGET_CONTRACT) is required")
 	}
-	if !common.IsHexAddress(cfg.TargetContract) {
-		return fmt.Errorf("indexer: invalid TARGET_CONTRACT %q", cfg.TargetContract)
+	for _, contract := range cfg.TargetContracts {
+		if !common.IsHexAddress(contract) {
+			return fmt.Errorf("indexer: invalid contract address %q", contract)
+		}
 	}
 	return nil
 }
@@ -136,7 +158,7 @@ func validate(cfg config.Config) error {
 func resolveContract(
 	ctx context.Context,
 	st *store.Store,
-	reader decoder.ChainReader,
+	client *chain.Client,
 	sourcify *decoder.SourcifyClient,
 	chainID uint64,
 	addr common.Address,
@@ -145,7 +167,7 @@ func resolveContract(
 	meta := store.ContractMeta{Address: addr, ABISource: abiSourceFallback}
 	abiTarget := addr
 
-	info, err := decoder.Detect(ctx, reader, addr)
+	info, err := decoder.Detect(ctx, client, addr)
 	if err != nil {
 		logger.Warn("proxy detection failed", "address", addr.Hex(), "err", err)
 	} else if info.IsProxy() {
@@ -170,6 +192,14 @@ func resolveContract(
 	} else {
 		meta.ABI = abiJSON
 		meta.ABISource = abiSourceSourcify
+	}
+
+	// decimals 用代理地址直接调用：USDC 这类代理会把调用转发给实现，代理侧就有这个方法。
+	// 读不到只告警——没有精度时接口回 null，前端不会拿错位数去换算。
+	if decimals, decimalsErr := client.Decimals(ctx, addr); decimalsErr != nil {
+		logger.Warn("decimals unavailable", "contract", addr.Hex(), "err", decimalsErr)
+	} else {
+		meta.Decimals = &decimals
 	}
 
 	if err := st.UpsertContractMeta(ctx, meta); err != nil {

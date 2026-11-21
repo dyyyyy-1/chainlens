@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -53,7 +54,10 @@ func run() error {
 
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: cfg.LogLevel})))
 
-	addr, err := resolveContract(cfg.TargetContract)
+	if len(cfg.TargetContracts) == 0 {
+		return errors.New("probe: TARGET_CONTRACT（或 TARGET_CONTRACTS）is required")
+	}
+	addr, err := resolveContract(cfg.TargetContracts[0])
 	if err != nil {
 		return err
 	}
@@ -81,7 +85,7 @@ func run() error {
 	}
 	printHeader(header)
 
-	logs, err := client.Fetch(ctx, from, to, addr)
+	logs, err := client.Fetch(ctx, from, to, []common.Address{addr})
 	if err != nil {
 		return err
 	}
