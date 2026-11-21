@@ -30,6 +30,14 @@ type EventStore interface {
 	Coverage(ctx context.Context) (store.Coverage, error)
 }
 
+// TokenMetaReader 提供合约精度，由 internal/store 满足。
+//
+// 单独一个接口而不是塞进 EventStore：事件检索不需要 decimals，
+// 把它塞进去会让 store 的 mock 被迫实现一个用不到的方法。
+type TokenMetaReader interface {
+	DecimalsByContracts(ctx context.Context, addresses []common.Address) (map[common.Address]uint8, error)
+}
+
 // ProfileReader 是地址画像能力，由 internal/profile 满足。
 type ProfileReader interface {
 	Holdings(ctx context.Context, addr common.Address, limit int) ([]profile.Holding, error)
@@ -50,6 +58,8 @@ type Deps struct {
 	// Tokens 非空时 /balances 附带链上余额；为空表示未配置 RPC，
 	// 响应里 onchain.enabled=false。
 	Tokens TokenReader
+	// Metas 非空时 /balances 为每个合约带上 decimals；为空时该字段为 null。
+	Metas TokenMetaReader
 	// WebDir 非空时在该目录托管前端构建产物（web/dist），并做 SPA 回退。
 	WebDir string
 

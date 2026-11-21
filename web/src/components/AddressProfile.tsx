@@ -13,7 +13,7 @@ import {
   type Onchain,
   type OnchainBalance,
 } from '../api'
-import { formatAmount, formatBlockTime, formatUnits, groupNumber, shortHex } from '../format'
+import { formatAmount, formatBlockTime, formatUnits, groupNumber, shortHex, USDC_DECIMALS } from '../format'
 import { CoverageBar } from './CoverageBar'
 
 interface ProfileState {
@@ -119,12 +119,14 @@ export function AddressProfile({ initialAddress }: { initialAddress: string }) {
                   </thead>
                   <tbody>
                     {state.holdings.map((holding) => {
-                      const amount = formatAmount(holding.net)
+                      // 精度由后端按合约给出；null 时才回退到 USDC 的 6 位，并在下方注明。
+                      const decimals = holding.decimals ?? USDC_DECIMALS
+                      const amount = formatAmount(holding.net, decimals)
                       const isOutflow = holding.net.startsWith('-')
                       return (
                         <tr key={holding.contract}>
                           <td className="mono">{shortHex(holding.contract)}</td>
-                          <td className="num" title={`原始整数：${amount.exact}`}>
+                          <td className="num" title={`原始整数：${amount.exact}（${decimals} 位小数）`}>
                             {amount.display}
                           </td>
                           {state.onchain.enabled ? (
@@ -158,8 +160,8 @@ export function AddressProfile({ initialAddress }: { initialAddress: string }) {
                   真实余额要查链上 <code>balanceOf()</code>，当前查询服务未配置 RPC。
                 </>
               )}
-              {state.holdings.some((holding) => state.onchain.balances?.[holding.contract]?.decimals === null)
-                ? ' 部分代币未取到小数位，金额按 6 位显示，仅供参考。'
+              {state.holdings.some((holding) => holding.decimals === null)
+                ? ' 部分合约未取到小数位，金额按 6 位显示，仅供参考。'
                 : ''}
             </div>
           </div>
@@ -241,7 +243,7 @@ export function AddressProfile({ initialAddress }: { initialAddress: string }) {
               </div>
             )}
             <div className="note">
-              当前索引只覆盖一个合约，所以这张表通常只有一行。等索引器支持多合约，它才反映真实的交互分布。
+              按事件数降序，不限事件类型。索引覆盖的合约越多，这张表越能反映真实的交互分布。
             </div>
           </div>
         </>

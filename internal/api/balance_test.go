@@ -211,3 +211,83 @@ func TestCapTokensKeepsOrderAndDropsDuplicates(t *testing.T) {
 		t.Fatalf("顺序或去重不对：%v", capped)
 	}
 }
+
+// fakeMetas 返回预置的合约精度，用于验证「精度随合约变化」而不是写死 6 位。
+type fakeMetas struct {
+	decimals map[common.Address]uint8
+	err      error
+}
+
+func (f *fakeMetas) DecimalsByContracts(_ context.Context, addresses []common.Address) (map[common.Address]uint8, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	result := make(map[common.Address]uint8, len(addresses))
+	for _, address := range addresses {
+		if value, ok := f.decimals[address]; ok {
+			result[address] = value
+		}
+	}
+	return result, nil
+}
+
+func TestBalancesIncludePerContractDecimals(t *testing.T) {
+	usdc := balanceSampleToken
+	weth := common.HexToAddress("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2")
+
+	handler := NewRouter(Deps{
+		Events: &fakeEvents{coverage: testCoverage()},
+		Profile: &fakeProfile{holdings: []profile.Holding{
+			{Contract: usdc, Net: big.NewInt(1), LogCount: 2},
+			{Contract: weth, Net: big.NewInt(2), LogCount: 3},
+		}},
+		Metas: &fakeMetas{decimals: map[common.Address]uint8{usdc: 6, weth: 18}},
+	})
+
+	body := decodeBody[balancesBody](t, get(t, handler, "/api/address/"+sampleAddress+"/balances"))
+	if len(body.Data) != 2 {
+		t.Fatalf("data 长度 = %d, want 2", len(body.Data))
+	}
+
+	byContract := make(map[string]*int, len(body.Data))
+	for _, item := range body.Data {
+		byContract[item.Contract] = item.Decimals
+	}
+
+	if got := byContract[hexAddress(usdc)]; got == nil || *got != 6 {
+		t.Fatalf("usdc decimals = %v, want 6", got)
+	}
+	// 18 位是 WETH 这类代币的常态。若这里仍是 6，说明精度没有按合约传递。
+	if got := byContract[hexAddress(weth)]; got == nil || *got != 18 {
+		t.Fatalf("weth decimals = %v, want 18", got)
+	}
+}
+
+func TestBalancesDecimalsNullWhenReaderMissing(t *testing.T) {
+	handler := newBalanceRouter(nil, balanceSampleHoldings())
+
+	body := decodeBody[balancesBody](t, get(t, handler, "/api/address/"+sampleAddress+"/balances"))
+	if len(body.Data) != 1 {
+		t.Fatalf("data 长度 = %d", len(body.Data))
+	}
+	if body.Data[0].Decimals != nil {
+		t.Fatalf("未配置元数据读取器时 decimals 必须为 null，得到 %v", *body.Data[0].Decimals)
+	}
+}
+
+func TestBalancesDecimalsNullWhenLookupFails(t *testing.T) {
+	handler := NewRouter(Deps{
+		Events:  &fakeEvents{coverage: testCoverage()},
+		Profile: &fakeProfile{holdings: balanceSampleHoldings()},
+		Metas:   &fakeMetas{err: errors.New("db down")},
+	})
+
+	recorder := get(t, handler, "/api/address/"+sampleAddress+"/balances")
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("精度查询失败不应改变状态码，得到 %d", recorder.Code)
+	}
+	body := decodeBody[balancesBody](t, recorder)
+	if body.Data[0].Decimals != nil {
+		t.Fatalf("查询失败时 decimals 必须为 null，得到 %v", *body.Data[0].Decimals)
+	}
+}

@@ -75,6 +75,8 @@ type holdingDTO struct {
 	Contract string `json:"contract"`
 	Net      string `json:"net"`
 	LogCount int64  `json:"log_count"`
+	// Decimals 为 null 表示未知。前端不得用默认值顶替：错一位数量级比「精度未知」更糟。
+	Decimals *int `json:"decimals"`
 }
 
 // balancesResponseDTO 在通用信封之外多给一个 onchain 块。
@@ -186,13 +188,20 @@ func (d Deps) handleBalances(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	decimals := d.decimalsFor(r.Context(), holdings)
+
 	items := make([]holdingDTO, 0, len(holdings))
 	for _, holding := range holdings {
-		items = append(items, holdingDTO{
+		item := holdingDTO{
 			Contract: hexAddress(holding.Contract),
 			Net:      holding.Net.String(),
 			LogCount: holding.LogCount,
-		})
+		}
+		if value, ok := decimals[holding.Contract]; ok {
+			exact := int(value)
+			item.Decimals = &exact
+		}
+		items = append(items, item)
 	}
 
 	coverage, err := d.Events.Coverage(r.Context())
@@ -206,6 +215,27 @@ func (d Deps) handleBalances(w http.ResponseWriter, r *http.Request) {
 		Data:     items,
 		Onchain:  d.onchainSnapshot(r.Context(), addr, holdings),
 	})
+}
+
+// decimalsFor 批量取合约精度；未配置读取器或查询失败时返回空 map。
+//
+// 失败只降级为 null：精度是展示用的元数据，不该让整个画像接口 500。
+func (d Deps) decimalsFor(ctx context.Context, holdings []profile.Holding) map[common.Address]uint8 {
+	if d.Metas == nil || len(holdings) == 0 {
+		return nil
+	}
+
+	addresses := make([]common.Address, 0, len(holdings))
+	for _, holding := range holdings {
+		addresses = append(addresses, holding.Contract)
+	}
+
+	decimals, err := d.Metas.DecimalsByContracts(ctx, addresses)
+	if err != nil {
+		d.logger().Warn("load contract decimals failed", "count", len(addresses), "err", err)
+		return nil
+	}
+	return decimals
 }
 
 // onchainSnapshot 组装链上余额块；未配置 RPC 时只给 enabled=false。

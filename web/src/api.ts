@@ -35,6 +35,8 @@ export interface Holding {
   contract: string
   net: string
   log_count: number
+  /** decimals 为 null 表示后端没取到精度，展示时不得用默认值冒充。 */
+  decimals: number | null
 }
 
 /**

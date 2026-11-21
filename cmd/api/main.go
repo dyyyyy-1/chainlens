@@ -97,6 +97,7 @@ func run() error {
 		RateLimitPerMinute: int(cfg.HTTPRateLimit),
 		APITokens:          cfg.APITokens,
 		Tokens:             tokens,
+		Metas:              st,
 		WebDir:             cfg.WebDir,
 	})
 
