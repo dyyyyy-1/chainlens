@@ -345,6 +345,16 @@ go run ./cmd/verify -source etherscan -segments 24 -width 5 -proxy http://127.0.
 
 rpc 模式会自动二分探测归档边界，只核对可回放的部分，不会把「超出窗口」误报成「数据缺失」。
 
+reorg 端到端回归（两种模式，断言相同）：
+
+```bash
+MODE=local bash scripts/reorg-test/run.sh   # 本地链 + 注入最小 ERC-20，完全离线（CI 用这个）
+bash scripts/reorg-test/run.sh              # fork 主网，冒充真实持有者转账
+```
+
+local 模式不 fork 主网：它用 `anvil_setCode` 把 59 字节的 runtime 注入目标地址，
+任何调用都会 emit 一条 `Transfer(0, to, value)`。这样回归不依赖外部端点，也就不会随第三方抖动而红。
+
 etherscan 模式按 `-segments × -width` 均匀抽样：单段日志数必须小于 1000（免费档上限，
 触到上限会报错而不是静默截断），因此宁可多段、窄段。默认 3 次/秒限速。
 
@@ -363,10 +373,18 @@ go build ./... && go vet ./... && go test ./... && gofumpt -l .
 测试分两层：纯函数单测（限流、地址填充、十进制解析、参数校验）与受环境变量门控的集成测试。
 
 ```bash
-# 画像层与真实库对账（默认跳过）
+# 画像层与真实库对账（默认跳过；需要库里有真实链上数据）
 CHAINLENS_TEST_DSN='postgres://chainlens:chainlens_dev@localhost:5432/chainlens?sslmode=disable' \
   go test ./internal/profile -v
+
+# store 写路径（默认跳过；用独立库，测试会在其中建临时 schema 后删除）
+CHAINLENS_TEST_DSN='postgres://chainlens:chainlens_dev@localhost:5432/chainlens_test?sslmode=disable' \
+  go test ./internal/store -v
 ```
+
+store 的用例覆盖的是**写路径语义**：COPY + `ON CONFLICT DO NOTHING` 的幂等、
+`UpsertDecoded` 的覆盖、`DeleteFrom` 的删除顺序（`decoded_event` 没有 `block_number`，
+只能通过 `chain_log` 反查，顺序写反会留下孤儿行）、游标推进与「无游标行必须报错」。
 
 ---
 

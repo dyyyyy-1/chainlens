@@ -15,7 +15,8 @@ W1 / W2 / W3（画像 + HTTP API）/ W4（回放对拍 + README）/ 加固 / 前
 
 **2026-11-20 交接后第一批已完成**（详见 §9）：链上余额（F2）、多口令轮换 + 日志指纹（F1 加固）、
 存量 3,978 条 `undecodable` 离线重解归零（F5）、CI / `.gitattributes` / `LICENSE` / `scripts/check.sh`（O3~O6）、
-Etherscan 第三方抽样对拍 24 段 / 9,773 条 0 差异（V1b）。
+Etherscan 第三方抽样对拍 24 段 / 9,773 条 0 差异（V1b）；
+store 写路径 15 个集成用例（V2）；reorg 回归改离线模式并进 CI（V4）。
 
 **§7.5 的四个阻塞决策已全部解开**，没有等待用户输入的事项。
 **没有做到一半的活。剩下的都是未开工项，清单在 §7。**
@@ -74,7 +75,8 @@ git -c http.proxy=http://127.0.0.1:<探到的端口> push origin main
 | make | **未安装** | `Makefile` 写好了但当前跑不了，直接用 `go` 命令 |
 
 **口令（本机开发用）**：PostgreSQL 超级用户 `postgres` / `CL_local_pg17x9`；应用用户 `chainlens` / `chainlens_dev`。
-数据库：`chainlens`（开发库）、`chainlens_anvil`（reorg 测试专用，可随意重置）。
+数据库：`chainlens`（开发库）、`chainlens_anvil`（reorg 测试专用，可随意重置）、
+`chainlens_test`（store 集成测试专用；测试会在其中建临时 schema 再删掉，不碰 public）。
 
 **go 依赖拉取**必须加环境变量，否则 `GOSUMDB` 默认指向国内镜像会 TLS 超时：
 
@@ -233,9 +235,9 @@ tasklist | grep -i indexer      # 有输出就先别启动
 | # | 事项 | 现状 |
 |---|---|---|
 | V1 | 第三方对拍 | ✅ **V1b 已完成**：`cmd/verify -source etherscan` 抽样 24 段 / 9,773 条，与库内逐字段比对（含 `block_time`），0 差异。发现 Etherscan 对个别日志返回空 `logIndex`，已按 `(tx, topics, data)` 唯一匹配处理。V1a（独立解码实现比对 `payload`）仍未做——它验证的是「解码语义」，V1b 验证的是「数据源一致」，两者不互相替代 |
-| V2 | `internal/store` 零测试 | 写路径（COPY + ON CONFLICT、游标推进、reorg 删除）只靠压测与对拍间接验证，没有单测 |
+| V2 | ~~`internal/store` 零测试~~ | ✅ 已补 15 个 PostgreSQL 集成用例（幂等、`DO NOTHING` vs `DO UPDATE`、游标、`DeleteFrom` 顺序与孤儿清理、晋升幂等、块头不被覆盖、ABI 不被空值覆盖）。CI 里起 postgres service 单独跑 |
 | V3 | `web/` 零自动化测试 | 无 vitest / RTL，完全靠手测 |
-| V4 | reorg 回归 | `scripts/reorg-test/run.sh` 只在 W2D2 跑过一次，未纳入任何回归流程 |
+| V4 | ~~reorg 回归~~ | ✅ 脚本改成双模式：`MODE=local` 用本地链 + 注入 59 字节最小 ERC-20 runtime，**完全离线**，已进 CI（`reorg` job）；`MODE=fork` 保留给本地手工验证 |
 
 ### 7.4 工程与运维
 
@@ -454,6 +456,28 @@ W4 之前需要知道的限制：
 
 **遗留的小账**：`Holdings.Net` 仍按 USDC 6 位换算（F4 未做），链上余额已用接口返回的 `decimals`。
 
+### 第二批：测试与回归（✅ 完成 2026-11-21）
+
+1. **V2 `internal/store` 集成测试**：15 个用例，重点是**写路径的语义**而不是 CRUD：
+   - `InsertLogs` 幂等（重扫返回 0 行）与「一条旧 + 一条新只插入 1 行」
+   - `InsertDecoded` 必须 `DO NOTHING`（索引器不覆盖），`UpsertDecoded` 必须 `DO UPDATE`（重解要覆盖）
+   - `Advance` 在没有游标行时必须报错；`EnsureCursor` 不能把已有游标拨回去
+   - `DeleteFrom` 的删除顺序：`decoded_event` 只能通过 `chain_log` 反查，顺序写反会留下孤儿行
+   - `InsertHeaders` 同高度不同哈希必须保留旧行（分叉由 `DeleteFrom` 显式清理）
+2. **隔离方式**：`TestMain` 在 `CHAINLENS_TEST_DSN` 指向的库里建临时 schema，所有连接带 `search_path`。
+   这样与 `internal/profile` 的只读集成测试**可以同时跑**，也不会碰 public 里的开发数据。
+   迁移文件用 simple protocol 执行（含多条语句与 `BEGIN/COMMIT`）。
+3. **V4 reorg 回归**：脚本支持 `MODE=local`——本地 anvil + `anvil_setCode` 注入 59 字节最小 ERC-20
+   （不校验 selector，只 emit `Transfer(0, to, value)` 并返回 true），完全离线。
+   断言与 fork 模式完全相同，已进 CI。fork 模式保留给本地手工验证（它依赖外部 RPC，放进 CI 会让门禁随第三方端点抖动）。
+
+本地跑：
+```bash
+CHAINLENS_TEST_DSN='postgres://chainlens:chainlens_dev@localhost:5432/chainlens_test?sslmode=disable' \
+  go test ./internal/store -v
+MODE=local bash scripts/reorg-test/run.sh
+```
+
 ---
 
 ## 10. 常用命令
@@ -496,8 +520,13 @@ go run ./cmd/verify -from 26432530 -to 26433029 -batch 500
 # 第三方抽样对拍（Etherscan V2；需 ETHERSCAN_API_KEY，代理端口要现测）
 go run ./cmd/verify -source etherscan -segments 24 -width 5 -proxy http://127.0.0.1:10808
 
+# store 写路径集成测试（独立库；测试自建临时 schema）
+CHAINLENS_TEST_DSN='postgres://chainlens:chainlens_dev@localhost:5432/chainlens_test?sslmode=disable' \
+  go test ./internal/store -v
+
 # reorg 端到端验证（用独立库，不碰开发库）
-bash scripts/reorg-test/run.sh
+bash scripts/reorg-test/run.sh              # fork 主网，需要外网
+MODE=local bash scripts/reorg-test/run.sh   # 离线，CI 用这个
 
 # 查库
 PGPASSWORD=chainlens_dev psql "postgres://chainlens:chainlens_dev@localhost:5432/chainlens?sslmode=disable"

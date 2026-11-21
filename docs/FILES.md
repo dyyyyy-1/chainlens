@@ -74,6 +74,7 @@
 | `decoded.go` | `InsertDecoded`（索引器用，冲突 `DO NOTHING`）、`UpsertDecoded`（重解用，冲突 `DO UPDATE`）、`UndecodableSummary`、`UndecodableLogs`（区间内未解码的原始日志）。两种冲突动作的差别就是「重扫不应改写」与「重解必须改写」。 | W1D3、交接后 |
 | `meta.go` | `UpsertContractMeta` / `LoadContractMeta`：代理识别结果的读写。`abi` 用 `COALESCE` 更新，避免重复解析时把已获取的 ABI 覆盖成空。 | W2D1 |
 | `cursor.go` | `EnsureCursor` / `LoadCursor` / `Advance`。游标推进必须由调用方传入事务。 | W1D2 |
+| `store_test.go` | 写路径的 PostgreSQL 集成测试（15 个用例）：`InsertLogs` 幂等与混合冲突、`InsertDecoded` 的 `DO NOTHING` 与 `UpsertDecoded` 的 `DO UPDATE`、游标推进与「无游标行必须报错」、`DeleteFrom` 的删除顺序（含 `decoded_event` 孤儿清理）、晋升确认水位的幂等、块头冲突不覆盖、`Coverage`/`Stats`、`UndecodableSummary`/`UndecodableLogs`、`UpsertContractMeta` 不覆盖已有 ABI。`TestMain` 在 `CHAINLENS_TEST_DSN` 指向的库里建**临时 schema**（连接带 `search_path`），与 `internal/profile` 的只读集成测试可以同时跑，也不碰 public。 | 交接后（2026-11-21） |
 | `query.go` | 只读查询面：`ListEvents`（按合约/区间过滤，支持键集游标，条件按需拼接）、`Coverage`（已索引区间）、`Stats`（水位 + 事件计数）、`LogsByRange`（区间原始日志，供 `cmd/verify` 对拍与导出）。与写路径分开：写路径服务于索引器的事务语义，读路径服务于查询服务。行扫描逻辑由 `scanLogRecord` 共用，避免两条查询的列顺序各写一遍。 | W3D3、W4 |
 
 **`logs.go` 为什么这么绕（临时表 → COPY → INSERT ... ON CONFLICT）**：
@@ -168,7 +169,7 @@ PostgreSQL 的 `COPY` 协议不支持 `ON CONFLICT`，而 §8.4 同时要求「C
 | `Makefile` | `build` / `vet` / `fmt` / `fmt-check` / `migrate` / `db-reset` / `probe`。**本机没有 make，实际入口是 `scripts/check.sh`**；Makefile 保留给装了 make 的环境。 | W1D1 |
 | `scripts/check.sh` | 本地质量门禁：`build` / `vet` / `test` / `gofumpt` + 前端 `lint` / `build`。与 CI 保持一致，避免「本地绿、CI 红」。`SKIP_WEB=1` 可只查 Go。 | 交接后（2026-11-20） |
 | `.gitattributes` | 统一 LF（`* text=auto eol=lf`），二进制文件不做转换。消除 Windows 上持续的 CRLF 警告，也防止 shell 脚本被 CRLF 破坏。 | 交接后（2026-11-20） |
-| `.github/workflows/ci.yml` | GitHub Actions：Go 侧 `gofumpt` / `build` / `vet` / `test`，前端侧 `npm ci` / `lint` / `build`。**不启动数据库**：`internal/profile` 的集成测试由 `CHAINLENS_TEST_DSN` 门控，未设置时按设计跳过。 | 交接后（2026-11-20） |
+| `.github/workflows/ci.yml` | GitHub Actions，三个 job：`go`（gofumpt / build / vet / test；另起 postgres service 单独跑 `internal/store` 写路径测试）、`reorg`（安装 Foundry，`MODE=local` 跑 reorg 端到端回归）、`web`（npm ci / lint / build）。`internal/profile` 的集成测试仍不在 CI——它需要在有真实链上数据的库上采样。 | 交接后（2026-11-20、11-21） |
 | `LICENSE` | MIT。仓库是 Public，未声明许可等于默认保留所有权利，会挡住复用。 | 交接后（2026-11-20） |
 | `.env.example` | §10 的环境变量模板，入库。真实 `.env` 在 `.gitignore` 内。W3D3 追加 `HTTP_ADDR`（仅查询服务读取）。 | W1D1、W3D3 |
 | `.gitignore` | 排除 `.env`、`.workbuddy/`（本地工作记录，含本机口令）、Go 构建产物。 | W1D1 |
@@ -180,7 +181,7 @@ PostgreSQL 的 `COPY` 协议不支持 `ON CONFLICT`，而 §8.4 同时要求「C
 
 | 文件 | 职责 | 阶段 |
 |---|---|---|
-| `scripts/reorg-test/run.sh` | reorg 端到端验证（§8.1 验收）。fork 主网 → 索引到链头 → 冒充 USDC 持有者转一笔真实转账 → 再挖两块 → `anvil_reorg` 深度 5 → 断言：分叉点识别、陈旧日志被删、块头换成新哈希、游标回退。使用独立库 `chainlens_anvil`，不触碰开发库。 | W2D2 |
+| `scripts/reorg-test/run.sh` | reorg 端到端验证（§8.1 验收）。**双模式**：`MODE=fork`（默认）fork 主网、冒充 USDC 持有者发真实转账；`MODE=local` 用本地链 + 注入 59 字节最小 ERC-20 runtime（`anvil_setCode`），**完全离线**。两者断言相同：分叉点识别、陈旧日志被删、块头换成新哈希、游标回退。使用独立库 `chainlens_anvil`。local 模式已进 CI。 | W2D2、交接后（2026-11-21） |
 
 ---
 
