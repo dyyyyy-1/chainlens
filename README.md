@@ -29,7 +29,7 @@ psql "postgres://chainlens@localhost:5432/chainlens" -f migrations/0002_decoded_
 
 # 2. 配置（.env 已被 .gitignore 排除）
 cp .env.example .env
-# 至少填 DATABASE_URL 与 TARGET_CONTRACT
+# 至少填 DATABASE_URL 与 TARGET_CONTRACT（或 TARGET_CONTRACTS）
 
 # 3. 前端（可选；构建后由 cmd/api 直接托管）
 cd web && npm install && npm run build && cd ..
@@ -55,7 +55,8 @@ curl -s "localhost:8080/api/address/0x000000000004444c5dc75cb358380d2e3de08a90/b
 | `DATABASE_URL` | 必填 |
 | `RPC_HTTP_URL` | 必填（索引器与对拍工具用） |
 | `CHAIN_ID` | 必填，主网为 `1`。不填会被拒绝，防止主网与测试网数据混写 |
-| `TARGET_CONTRACT` | 必填，被索引的合约 |
+| `TARGET_CONTRACT` | 被索引的合约（单值写法） |
+| `TARGET_CONTRACTS` | 逗号分隔的多个合约，**优先于** `TARGET_CONTRACT` |
 | `START_BLOCK` | 起始区块 |
 | `CONFIRMATIONS` | 最终性窗口，默认 12 |
 | `BATCH_BLOCK_RANGE` | 单批区块数，默认 2000。换端点补历史时要按端点上限调小 |
@@ -217,7 +218,7 @@ curl -s "localhost:8080/api/address/0x000000000004444c5dc75cb358380d2e3de08a90/b
 ```json
 {
   "coverage": {"from_block": 26422714, "to_block": 26455400, "next_block": 26455401},
-  "data": [{"contract": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48", "net": "-7202785433099", "log_count": 204534}],
+  "data": [{"contract": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48", "net": "-7202785433099", "log_count": 204534, "decimals": 6}],
   "onchain": {
     "enabled": true,
     "balances": {
@@ -315,7 +316,7 @@ npm run dev      # http://localhost:5173
 
 ## 局限（请先读这一段）
 
-1. **只覆盖一段区间。** 当前库内约 3.27 万块（26,422,714..26,455,389，随索引器推进）。因此「净变化」是区间内累加、「授权」是区间内快照，**都不能直接当链上当前状态用**。链上余额（`onchain`）不受此限，但它是实时值，不是历史快照。
+1. **只覆盖一段区间，且所有合约共享同一起点。** 当前库内约 3.27 万块（26,422,714..26,455,389，随索引器推进）。多合约时后加入的合约也从 `START_BLOCK` 扫起，没有 per-contract 起点。因此「净变化」是区间内累加、「授权」是区间内快照，**都不能直接当链上当前状态用**。链上余额（`onchain`）不受此限，但它是实时值，不是历史快照。
 2. **第三方交叉验证只覆盖抽样。** `cmd/verify -source etherscan` 走 Etherscan V2 抽样 24 段 / 9,773 条，与库内逐字段比对（含 `block_time`），0 差异；另有同源全量回放（19 批 / 783,105 条 / 0 差异）。抽样证明「在样本上与第三方一致」，不等于全量一致——免费档单次最多 1,000 条且有日限额。实测还发现 Etherscan 对个别日志返回空 `logIndex`（`"0x"`），这类条目按 `(tx, topics, data)` 在库内唯一匹配后计入比对，匹配不上的会计入 missing，不会被静默跳过。
 3. **免费端点的归档窗口约 10,000 块且滚动。** 索引器停机过久，`next_block` 会滑出窗口，`eth_getLogs` 报 `Archive requests require a personal token`，需要把 `START_BLOCK` 与游标回拨到窗口内。
 4. **`/api/stats` 的计数是全表聚合**，随数据量线性变慢（84.9 万行 176 ms → 279 万行 360 ms，约线性）。已加 10 秒进程内缓存挡住重复请求，但没有解决复杂度；全量索引 USDC 后仍需计数表或物化视图。
@@ -323,7 +324,7 @@ npm run dev      # http://localhost:5173
    但不能区分调用者身份、不能单独撤销某一个调用方、也没有细粒度授权。多值写法只解决轮换，
    不构成身份体系；访问日志里的 token 指纹只能做粗粒度归因。要真身份需要认证服务。
 6. `/api/events` 已支持键集分页；为兼容旧调用保留了 `offset`，深翻页会退化，建议改用 `cursor`。
-7. **净变化仍按 USDC 的 6 位小数格式化**（`Holdings` 还没返回每个合约的 decimals）。链上余额已改用接口返回的 `decimals`，未知时界面显示「精度未知」而不是猜一个值。索引其他代币前需要补 F4。
+7. **`decimals` 取不到时会回退 6 位。** 精度来自 `contract_meta`（索引器启动时调 `decimals()` 写入）；读取失败或合约没实现该方法时，接口返回 `null`，界面按 USDC 的 6 位显示并在表格下方注明。`null` 与 `0`（整数型代币）是两回事，不要合并。
 8. **链上余额依赖 RPC 端点。** 免费端点限流或不可达时该字段降级为 `unavailable`，不影响其余接口；但它意味着查询服务的可用性不再只由数据库决定。
 
 ---

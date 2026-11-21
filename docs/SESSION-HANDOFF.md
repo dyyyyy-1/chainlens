@@ -16,7 +16,8 @@ W1 / W2 / W3（画像 + HTTP API）/ W4（回放对拍 + README）/ 加固 / 前
 **2026-11-20 交接后第一批已完成**（详见 §9）：链上余额（F2）、多口令轮换 + 日志指纹（F1 加固）、
 存量 3,978 条 `undecodable` 离线重解归零（F5）、CI / `.gitattributes` / `LICENSE` / `scripts/check.sh`（O3~O6）、
 Etherscan 第三方抽样对拍 24 段 / 9,773 条 0 差异（V1b）；
-store 写路径 15 个集成用例（V2）；reorg 回归改离线模式并进 CI（V4）。
+store 写路径 15 个集成用例（V2）；reorg 回归改离线模式并进 CI（V4）；
+多合约索引（F3）与 decimals 元数据（F4）已落地。
 
 **§7.5 的四个阻塞决策已全部解开**，没有等待用户输入的事项。
 **没有做到一半的活。剩下的都是未开工项，清单在 §7。**
@@ -132,10 +133,12 @@ tasklist | grep -i indexer      # 有输出就先别启动
 
 不要在这里重复代码说明，直接看 **`docs/FILES.md`**——它逐文件写了职责和"为什么这样拆"。
 
-三条关键约定，改动时不要破坏：
+四条关键约定，改动时不要破坏：
 
 1. **ADR-1**：区块数据与游标必须在同一事务内提交，否则崩溃会出现"游标前进但数据丢失"。
 2. **接口在使用方声明**：`LogFetcher` / `HeaderFetcher` / `LogStore` / `EventDecoder` 定义在 `internal/indexer`，`ChainReader` 定义在 `internal/decoder`；`chain` 与 `store` 只提供具体类型，不反向依赖。
+3. **解码器按合约分发**：多合约时按日志的 `Address` 从 `Decoders.ByContract` 取；`Fallback` 只兜底未知地址，不允许「拿一个 ABI 解所有合约」——用错 ABI 不报错，只会静默解成 undecodable 或解错字段。
+4. **精度只来自 `contract_meta.decimals`**：缺失时接口返回 `null`、前端回退 6 位并注明；不允许在后端写死某个代币的位数。`NULL`（未知）与 `0`（整数型代币）必须区分。
 3. **解码失败不中断入库**：`decoder.Decode` 不返回 error，失败记为 `undecodable` 状态入库（§8.3）。
 
 ### 5.1 对 `HANDOFF.md` 的偏离登记
@@ -215,8 +218,8 @@ tasklist | grep -i indexer      # 有输出就先别启动
 |---|---|---|---|---|
 | F1 | 真正的身份体系 | ✅ 已定：**维持静态 token**，另加逗号分隔多口令（轮换）+ 日志记 token 指纹 | 仍不能区分调用者身份、不能单独撤销某一个调用方 | 已定案。需要时再上 API key 表，不预先建 |
 | F2 | 真实余额 | ✅ 已做：`/balances` 增 `onchain` 块（`balanceOf` + `decimals`），10s 缓存，失败降级不影响主字段 | 只覆盖 `holdings` 前 5 个合约；只能看「现在」，没有历史余额 | 已定案（可失败设计） |
-| F3 | 多合约索引 | `TARGET_CONTRACT` 只支持单合约 | `/interactions` 恒为一行；画像只覆盖 USDC | 需改配置结构与 API 维度，工作量中等 |
-| F4 | decimals 元数据 | 前端常量按 USDC 6 位换算 | 索引其他代币时金额差 10^N | 需 `contract_meta` 增列 + 接口返回 + 前端改造 |
+| F3 | 多合约索引 | ✅ 已做：`TARGET_CONTRACTS`（逗号分隔，回退 `TARGET_CONTRACT`）；一次 `eth_getLogs` 带多个地址；每个合约独立的 ABI 解码器 | 所有合约共享同一个 `START_BLOCK` 与游标；新加的历史更长的合约会从头扫 | 已闭环 |
+| F4 | decimals 元数据 | ✅ 已做：`contract_meta.decimals`（migration 0003）、索引器启动时写入、`/balances` 按合约返回，前端不再写死 6 位 | 读取失败时降级为 null（前端回退 6 位并注明） | 已闭环 |
 | F5 | `cmd/redecode` | ✅ 已做：**离线重解**（读 `chain_log` → 解码 → 覆盖写 `decoded_event`），3,978 → 0 | 将来新出现的未解码仍需重跑一次（秒级） | 已闭环，原理见 §8 第 1 条 |
 | F6 | 前端深链 | 标签页切换不写 URL | 刷新回到统计页，无法分享「某个地址的画像」 | 无。用 URLSearchParams 或轻量路由即可 |
 | F7 | 事件导出 | 无 | 只能翻页看，不能导出 CSV / JSON | 无 |
@@ -478,6 +481,30 @@ CHAINLENS_TEST_DSN='postgres://chainlens:chainlens_dev@localhost:5432/chainlens_
 MODE=local bash scripts/reorg-test/run.sh
 ```
 
+### 第三批：多合约与精度（✅ 完成 2026-11-21）
+
+**F4 decimals**
+- `migrations/0003`：`contract_meta.decimals smallint NULL`，`CHECK (0..255)`。NULL 是未知，0 是整数型代币。
+- 索引器启动时对每个合约调 `decimals()` 写入；`UpsertContractMeta` 用 `COALESCE`，RPC 抖动一次不会把已知值抹掉。
+- `/balances` 的 `data[].decimals` 按合约返回；`store.DecimalsByContracts` 只 SELECT 精度，不拖回几十 KB 的 ABI。
+- 前端 `net` 用接口精度换算，`null` 时回退 6 位并在表格下方注明。
+
+**F3 多合约**
+- 配置 `TARGET_CONTRACTS=a,b`，为空回退 `TARGET_CONTRACT`（旧 `.env` 与脚本不用改）。
+- `chain.Fetch` 接受地址数组：同一区间的块只扫一遍，而不是每合约重复请求。
+- `indexer.Decoders{ByContract, Fallback}`：按日志 `Address` 分发。用错 ABI 不报错，只会静默解成 undecodable，所以分发必须显式。
+- `cmd/redecode` 按合约分别重解（`UndecodableSummary/Logs` 都加了 contract 过滤）；`cmd/verify` 默认核对配置里的全部合约。
+
+**验证**
+- anvil 双合约：两个地址分别注入 decimals=6 / 18 的最小 runtime，各发一笔转账。索引后
+  `chain_log` 两合约分别为 1 / 2 条，`contract_meta` 精确为 6 / 18，`decoded_undecodable=0`；
+  画像的 `Interactions` 按合约分组返回两行——这正是 F3 要解决的问题。
+- 主网：`contract_meta.decimals=6`，`/balances` 的 `data[0].decimals=6`。
+
+**踩坑**：最初的最小 ERC-20 bytecode 不校验 selector，导致 `decimals()` 也被当成 `transfer` 处理并返回 1，
+`contract_meta.decimals` 被写成 1。改成按 `CALLDATASIZE` 分支（4 字节走 decimals、68 字节走 transfer），
+两个变体只差一个字节（`6006` / `6012`）。这类「看起来对但值是错的」只能靠实际数据发现。
+
 ---
 
 ## 10. 常用命令
@@ -494,6 +521,8 @@ go build ./... && go vet ./... && go test ./... && ~/go/bin/gofumpt -l .
 
 # 跑索引器（依赖本地 .env，已 gitignore）
 go run ./cmd/indexer
+# 临时覆盖目标合约（多合约用逗号分隔）
+TARGET_CONTRACTS=0xA0b8...eB48,0x... go run ./cmd/indexer
 
 # 前端：开发模式（Vite 起在 5173，/api 代理到 8080）
 cd web && npm install && npm run dev
@@ -533,7 +562,7 @@ PGPASSWORD=chainlens_dev psql "postgres://chainlens:chainlens_dev@localhost:5432
 ```
 
 `.env` 关键项：`DATABASE_URL`、`RPC_HTTP_URL=https://ethereum-rpc.publicnode.com`、`CHAIN_ID=1`、
-`TARGET_CONTRACT=0xA0b8...eB48`、`START_BLOCK=26422714`、`CONFIRMATIONS=12`、`BATCH_BLOCK_RANGE=2000`、
+`TARGET_CONTRACTS=0xA0b8...eB48[,0x...]`（回退单值 `TARGET_CONTRACT`）、`START_BLOCK=26422714`、`CONFIRMATIONS=12`、`BATCH_BLOCK_RANGE=2000`、
 `HTTP_ADDR=:8080`（仅查询服务读取）。
 
 ---
