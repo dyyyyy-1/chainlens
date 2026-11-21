@@ -1,8 +1,12 @@
 name: ci
 
-# 门禁与本地 scripts/check.sh 保持一致：Go 侧 build / vet / test / gofumpt，
-# 前端侧 lint / build。测试不连数据库——internal/profile 的集成测试
-# 需要 CHAINLENS_TEST_DSN，CI 不设置它，会按设计跳过。
+# 三个 job：
+#   go     build / vet / test / gofumpt；另起 postgres 单独跑 internal/store 的写路径测试
+#   reorg  reorg 端到端回归，MODE=local 完全离线
+#   web    npm ci / lint / build
+#
+# internal/profile 的集成测试不在 CI：它需要在有真实链上数据的库上采样，
+# 空库会让它失败，属于本地手工验证。
 on:
   push:
     branches: [main]
@@ -14,6 +18,22 @@ permissions:
 jobs:
   go:
     runs-on: ubuntu-latest
+    # store 的写路径测试需要真实 PostgreSQL：COPY + ON CONFLICT、DO UPDATE、
+    # 以及 DeleteFrom 的三条语句顺序，都无法用 mock 验证。
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: chainlens
+          POSTGRES_PASSWORD: chainlens_dev
+          POSTGRES_DB: chainlens_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U chainlens"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     steps:
       - uses: actions/checkout@v4
 
@@ -38,8 +58,47 @@ jobs:
       - name: vet
         run: go vet ./...
 
-      - name: test
+      - name: test (无数据库依赖)
         run: go test ./...
+
+      # 单独一个步骤而不是给整个 job 设 DSN：internal/profile 的集成测试
+      # 需要在有真实链上数据的库上采样，空库会让它失败。这里只放开 store。
+      - name: test (store 写路径，PostgreSQL)
+        env:
+          CHAINLENS_TEST_DSN: postgres://chainlens:chainlens_dev@localhost:5432/chainlens_test?sslmode=disable
+        run: go test ./internal/store
+
+  # reorg 端到端回归：用 MODE=local 完全离线跑。
+  # fork 模式依赖外部主网 RPC，放进 CI 会让门禁随第三方端点抖动，因此不在这里跑。
+  reorg:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: chainlens
+          POSTGRES_PASSWORD: chainlens_dev
+          POSTGRES_DB: chainlens_anvil
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U chainlens"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: install foundry
+        uses: foundry-rs/foundry-toolchain@v1
+
+      - name: reorg regression
+        run: MODE=local bash scripts/reorg-test/run.sh
 
   web:
     runs-on: ubuntu-latest
