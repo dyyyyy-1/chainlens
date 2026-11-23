@@ -17,6 +17,7 @@
 | `cmd/verify/main_test.go` | 证明比对函数**能发现差异**（缺失 / 多余 / data 改动 / 块时间漂移），以及区间收敛的边界。没有这组用例，「0 差异」的结论不可信。 | W4 |
 | `cmd/verify/etherscan.go` | `-source etherscan`：把 Etherscan V2 的 `getLogs` 作为**独立数据源**做抽样对拍，复用 `diffBatch`。数值字段兼容 hex 与十进制；3 次/秒限速；单次触到 1000 条上限直接报错（免费档会静默截断）。`sampleRanges` 负责均匀抽样。`reconcileIndexless` 处理第三方返回空 `logIndex` 的条目：按 `(tx, topics, data)` 唯一匹配，零候选计 missing，多候选报错而不是猜。 | 交接后（2026-11-20） |
 | `cmd/verify/etherscan_test.go` | `parseQuantity` / `isBlankQuantity` / `sampleRanges` / `reconcileIndexless` 的表驱动测试，含「多候选必须报错」「空 logIndex 不得退化成 0」两条边界。 | 交接后（2026-11-20） |
+| `cmd/bench/main.go` | 吞吐归因工具：只测「拉取 + 解码」，**不写库**。`-split` 用 `rpc.CallContext` 取 `json.RawMessage`，把网络传输与 JSON 反序列化分开计时；`-h1` / `-nocompress` 用于验证协议与压缩的影响。`-margin` 让起始块跟着链头走（免费端点窗口实测不足 10,000 块）。 | 交接后（2026-11-23） |
 | `cmd/redecode/main.go` | **离线重解**存量 `undecodable` 日志：从 `chain_log` 读原始日志、用 `contract_meta` 里的 ABI 重解、按块区间分批覆盖写 `decoded_event`。**不访问 RPC、不碰 `index_cursor`、不改 `chain_log`**，因此与索引器可并存。默认 dry-run，`-apply` 才写库。 | 交接后（2026-11-20） |
 
 ---
