@@ -221,8 +221,8 @@ tasklist | grep -i indexer      # 有输出就先别启动
 | F3 | 多合约索引 | ✅ 已做：`TARGET_CONTRACTS`（逗号分隔，回退 `TARGET_CONTRACT`）；一次 `eth_getLogs` 带多个地址；每个合约独立的 ABI 解码器 | 所有合约共享同一个 `START_BLOCK` 与游标；新加的历史更长的合约会从头扫 | 已闭环 |
 | F4 | decimals 元数据 | ✅ 已做：`contract_meta.decimals`（migration 0003）、索引器启动时写入、`/balances` 按合约返回，前端不再写死 6 位 | 读取失败时降级为 null（前端回退 6 位并注明） | 已闭环 |
 | F5 | `cmd/redecode` | ✅ 已做：**离线重解**（读 `chain_log` → 解码 → 覆盖写 `decoded_event`），3,978 → 0 | 将来新出现的未解码仍需重跑一次（秒级） | 已闭环，原理见 §8 第 1 条 |
-| F6 | 前端深链 | 标签页切换不写 URL | 刷新回到统计页，无法分享「某个地址的画像」 | 无。用 URLSearchParams 或轻量路由即可 |
-| F7 | 事件导出 | 无 | 只能翻页看，不能导出 CSV / JSON | 无 |
+| F6 | 前端深链 | ✅ 已做：`?tab=address&address=…` / `?tab=events&contract=…&from=…&to=…`，刷新与分享可还原；带地址的链接自动查询 | 翻页游标不写 URL（它是「读到哪了」，不是可分享状态） | 已闭环 |
+| F7 | 事件导出 | ✅ 已做：`GET /api/events/export?format=csv\|json`，先 count 再流式写，上限 20 万行 | 导出是同步请求，前端把整个响应收进 Blob 再下载；更大规模应走命令行 | 已闭环 |
 
 ### 7.2 性能与容量
 
@@ -457,7 +457,29 @@ W4 之前需要知道的限制：
      匹配不上计入 missing，多候选直接报错——**不能丢弃**，否则会掩盖真正的数据缺失。
    - 本机 `HTTPS_PROXY` 指向的端口可能是死的（本次是 53451），实际可用的是 10808；代理端口每次要现测。
 
-**遗留的小账**：`Holdings.Net` 仍按 USDC 6 位换算（F4 未做），链上余额已用接口返回的 `decimals`。
+**遗留的小账**：~~`Holdings.Net` 仍按 USDC 6 位换算~~（F4 已完成，改为按合约精度）。
+
+### 第四批：深链与导出（✅ 完成 2026-11-23）
+
+**F6 深链**
+- `web/src/urlState.ts`：`URLSearchParams` + `replaceState`，不引路由库。只写当前标签页相关字段。
+- 地址页带 `?address=` 时**自动查询一次**，分享出去的链接点开就是结果，而不是空表单。
+- 事件页的过滤条件同样入 URL；翻页游标不入（那是会话状态，不是可分享状态）。
+
+**F7 导出**
+- `GET /api/events/export?format=csv|json&contract&from&to`。
+- **先 `CountEvents` 再流式写**：一旦开始写响应体就不能改状态码，超限必须在写之前 400；
+  否则用户拿到的是一个悄悄截断的文件。
+- 拒绝 `limit/cursor/offset`：导出语义是「整个过滤范围」，带分页参数说明理解错了。
+- CSV 的 payload 保持一列紧凑 JSON，不把不同事件字段拍平成大量空列。
+- 前端用 fetch + Blob 下载（`<a href>` 不会带 Authorization 头）。
+- `store` 抽了 `buildEventQuery` / `buildEventConditions` / `scanEvent`，让分页与导出共用同一套过滤与排序——
+  两处各写一份迟早出现「页面少一条、导出多一条」。
+
+**验证**
+- curl：CSV 表头与 353 行数据、JSON 数组、`limit` 400、无过滤 400（`matched 3113489 rows`）、非法 format 400。
+- 浏览器：`?tab=address&address=…` 直接出画像（净变化 -8,908,015.988253 / 链上余额 31,472,363.051373）；
+  `?tab=events&contract=…&from=…&to=…` 直接出 50 条并可导出，下载文件 353 行、表头与 payload 列正确。
 
 ### 第二批：测试与回归（✅ 完成 2026-11-21）
 

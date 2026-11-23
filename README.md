@@ -213,6 +213,21 @@ curl -s "localhost:8080/api/address/0x000000000004444c5dc75cb358380d2e3de08a90/b
 
 `cursor` 与 `offset` 互斥，同时给出会返回 400，避免两种翻页语义在客户端悄悄错位。
 
+### `GET /api/events/export`
+
+把当前过滤条件下的**全部**事件导出为 CSV 或 JSON（`format=csv|json`，缺省 csv）：
+
+```bash
+curl -OJ "localhost:8080/api/events/export?format=csv&contract=0xA0b8…&from=26456000&to=26456100"
+```
+
+- 参数只接受 `format` / `contract` / `from` / `to`；带 `limit`、`cursor`、`offset` 会返回 400——
+  导出的语义是整个过滤范围，不是某一页。
+- 上限 20 万行。**先数再写**：超出时直接 400 `export_too_large`，不会给一个悄悄截断的文件。
+- CSV 列：`block_number, block_time, tx_hash, log_index, contract, event, status, payload`，
+  `payload` 是紧凑 JSON 字符串（不同事件字段不同，拍平成列会产生大量空列）。
+- 该接口受同样的 Bearer 鉴权保护，所以前端用 fetch 下载而不是给一个链接。
+
 ### `GET /api/address/{addr}/balances`
 
 ```json
@@ -269,6 +284,9 @@ curl -s "localhost:8080/api/address/0x000000000004444c5dc75cb358380d2e3de08a90/b
 |---|---|---|
 | 400 | `invalid_address` / `invalid_contract` / `invalid_range` / `invalid_limit` / `invalid_offset` / `invalid_cursor` | 参数不合法 |
 | 400 | `conflicting_pagination` | `cursor` 与 `offset` 同时给出 |
+| 400 | `invalid_export_query` | 导出接口收到了 `limit` / `cursor` / `offset` |
+| 400 | `export_too_large` | 导出命中行数超过 20 万，需要缩小区块范围 |
+| 400 | `invalid_format` | 导出格式不是 `csv` 或 `json` |
 | 405 | — | 非 GET 请求 |
 | 401 | `unauthorized` | 启用了 `API_TOKEN` 但缺少或携带错误的 Bearer token |
 | 429 | `rate_limited` | 超出按 IP 的请求速率，响应带 `Retry-After` |
@@ -325,7 +343,8 @@ npm run dev      # http://localhost:5173
    不构成身份体系；访问日志里的 token 指纹只能做粗粒度归因。要真身份需要认证服务。
 6. `/api/events` 已支持键集分页；为兼容旧调用保留了 `offset`，深翻页会退化，建议改用 `cursor`。
 7. **`decimals` 取不到时会回退 6 位。** 精度来自 `contract_meta`（索引器启动时调 `decimals()` 写入）；读取失败或合约没实现该方法时，接口返回 `null`，界面按 USDC 的 6 位显示并在表格下方注明。`null` 与 `0`（整数型代币）是两回事，不要合并。
-8. **链上余额依赖 RPC 端点。** 免费端点限流或不可达时该字段降级为 `unavailable`，不影响其余接口；但它意味着查询服务的可用性不再只由数据库决定。
+8. **导出是同步请求。** 20 万行 CSV 约 40 MB，前端要把它整个收进 Blob 再触发下载；更大的规模应该用命令行直连数据库，而不是让浏览器做 ETL。
+9. **链上余额依赖 RPC 端点。** 免费端点限流或不可达时该字段降级为 `unavailable`，不影响其余接口；但它意味着查询服务的可用性不再只由数据库决定。
 
 ---
 

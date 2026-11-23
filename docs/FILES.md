@@ -111,6 +111,7 @@ PostgreSQL 的 `COPY` 协议不支持 `ON CONFLICT`，而 §8.4 同时要求「C
 |---|---|---|
 | `router.go` | 路由（5 个端点）、`EventStore` / `ProfileReader` / `TokenReader` 三个窄接口、请求中间件（超时预算、panic 恢复、访问日志、状态码记录）、按 IP 限流的接线。`withBalance` 在配置了 `Tokens` 时注入余额服务，未配置则保持 nil。 | W3D3、加固、交接后 |
 | `handlers.go` | 参数解析与校验（含键集游标）、错误映射（超时 → 503、内部错误 → 500 且不泄露 SQL）、响应 DTO 与 `coverage` 封装、hex 与时间格式化。`/balances` 用专用 DTO：`data` 是区间净变化（含每合约 `decimals`），`onchain` 是可选的链上余额，两者语义不同故不混在同一层。精度读取失败只降级为 `null`，不让整个画像接口 500。 | W3D3、加固、交接后 |
+| `export.go` | `/api/events/export`：CSV / JSON 导出。**先 `CountEvents` 再流式写**——响应头一旦发出就不能改状态码，所以超限（20 万行）必须在写之前 400。不接受 `limit/cursor/offset`：导出的语义是整个过滤范围。CSV 的 payload 是一列紧凑 JSON，不把不同事件的字段拍平成大量空列。 | 交接后（2026-11-23） |
 | `balance.go` | 链上余额的编排：`TokenReader` 窄接口、并发查询（每个代币一个 goroutine，上限 5 个）、两级缓存（余额 10s / decimals 1h）、过期清理。单代币失败只影响该单元格，并回 `status=unavailable` + 顶层 `onchain.error`。 | 交接后（2026-11-20） |
 | `static.go` | 托管前端构建产物并做 SPA 回退。`/api/*` 的未匹配路径**不回退**到 index.html，而是返回 JSON 404——否则客户端会拿到 200 + HTML，把「接口不存在」误读成「接口返回了奇怪的东西」。路径先 `path.Clean` 再拼接，防止穿越。 | 前端 |
 | `auth.go` | 可选的 Bearer token 校验：`API_TOKEN` 为空时完全不介入。该变量支持**逗号分隔多口令**以便轮换（新旧并存，不必让调用方同一刻切换），逐个定长比较且**不短路**（短路会通过响应时间泄漏命中顺序）。`tokenFingerprint` 给访问日志提供 SHA-256 前 4 字节指纹，能区分调用方而不落明文。**这仍是静态共享密钥，不是身份体系。** | 加固、交接后 |
@@ -152,10 +153,11 @@ PostgreSQL 的 `COPY` 协议不支持 `ON CONFLICT`，而 §8.4 同时要求「C
 | `web/vite.config.ts` | 开发期把 `/api` 代理到 `127.0.0.1:8080`；生产由 `cmd/api` 同源托管，不需要代理。 |
 | `web/src/api.ts` | 与后端 DTO 一一对应的类型与请求封装。金额字段一律 `string`，禁止转 `number`。`ApiError` 保留后端错误码，便于界面区分参数错与超时。 |
 | `web/src/format.ts` | 金额与地址格式化。**全程字符串运算**：uint256 超出 `Number.MAX_SAFE_INTEGER`，转 number 是不可逆的精度丢失。 |
-| `web/src/App.tsx` | 顶栏、三个标签页、token 输入（存 localStorage）。改 token 时以 token 为 key 重新挂载，自动按新凭据重取。 |
+| `web/src/App.tsx` | 顶栏、三个标签页、token 输入（存 localStorage）。改 token 时以 token 为 key 重新挂载，自动按新凭据重取。标签页、地址、事件过滤都走 `urlState`，刷新与分享能还原同一视图。 |
+| `web/src/urlState.ts` | 用 `URLSearchParams` + `replaceState` 把界面状态写进 URL，不引入路由库。只写当前标签页相关字段（从地址页切走时不留下 `address`）。用 replace 而非 push：输入框每敲一个字符都进历史，后退键就废了。 |
 | `web/src/components/StatsPanel.tsx` | 索引统计。指标卡 + 覆盖区间 + 数据新鲜度。 |
-| `web/src/components/AddressProfile.tsx` | 地址画像。三个表（余额与净变化 / 授权 / 交互），各表下方写明语义边界。链上余额列只在 `onchain.enabled` 时出现；取不到就写「获取失败」，`decimals` 为 null 就写「精度未知」——不猜、不回 0。 |
-| `web/src/components/EventExplorer.tsx` | 事件检索。过滤 + 游标翻页；参数按事件类型（Transfer / Approval / 其他）压成一行。 |
+| `web/src/components/AddressProfile.tsx` | 地址画像。三个表（余额与净变化 / 授权 / 交互），各表下方写明语义边界。带 `?address=` 的深链会**自动查询一次**，分享出去点开就能看到结果。链上余额列只在 `onchain.enabled` 时出现；取不到就写「获取失败」，`decimals` 为 null 就写「精度未知」——不猜、不回 0。 |
+| `web/src/components/EventExplorer.tsx` | 事件检索。过滤 + 游标翻页；参数按事件类型（Transfer / Approval / 其他）压成一行。带 `导出 CSV / JSON` 按钮，导出走 fetch 而非 `<a href>`——接口受 Bearer 鉴权保护，链接不会带 Authorization 头。 |
 | `web/src/components/CoverageBar.tsx` | 覆盖区间条。空结果必须能区分「确实没有记录」与「这段历史还没索引」。 |
 | `web/src/styles.css` | 暗色设计系统（CSS 变量、卡片、表格、语义标签）。无第三方样式库。 |
 
