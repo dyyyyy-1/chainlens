@@ -380,6 +380,27 @@ etherscan 模式按 `-segments × -width` 均匀抽样：单段日志数必须�
 
 ---
 
+## 停机后怎么恢复
+
+免费端点只保留最近约 10,000 块。停机超过约 1.4 天，`next_block` 会滑出窗口，
+`eth_getLogs` 报 `Archive requests require a personal token`，直接重启必然第一批就失败。
+
+```bash
+# 先判断（不连库、不改数据，只探测免费端点还能不能提供服务）
+bash scripts/fill-gap.sh --dry-run
+
+# 需要补时：脚本用归档端点按 100 块/批补到窗口内，再留 500 块余量
+bash scripts/fill-gap.sh --serve
+```
+
+判断依据是**实际探测**而不是写死「10,000 块」——窗口是滚动的，写死的数字迟早失效。
+脚本会拒绝在已有索引器运行时启动第二个实例（两个实例会抢游标）。
+
+补缺口期间速度约 2.5 块/秒（归档端点 + 100 块/批），比 publicnode 的约 19 块/秒慢 8 倍，
+所以补完一定要切回 `RPC_HTTP_URL` 指向的免费端点。
+
+---
+
 ## 开发
 
 ```bash

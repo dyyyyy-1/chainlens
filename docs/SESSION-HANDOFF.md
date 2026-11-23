@@ -230,7 +230,7 @@ tasklist | grep -i indexer      # 有输出就先别启动
 |---|---|---|---|
 | P1 | `/api/stats` 全表 count | 84.9 万行 176 ms → 279 万行 360 ms，基本线性 | 已有 10 秒 TTL 缓存挡住重复请求；计数表方案被否（漂移风险，见 §5.1 第 13 条） |
 | P2 | 索引器吞吐 | 约 19 块/秒（W1 时 34~39） | 日志密度只涨 20%，单条成本却翻倍；无法区分端点限流 / 带宽 / 端点负载 |
-| P3 | `chain_log` 容量 | 279 万行 / 1 GB，单表无分区 | 全量索引 USDC 估算 6 天、TB 级存储；分区或冷数据归档策略**尚未设计** |
+| P3 | `chain_log` 容量 | ✅ **方案已定**：按 `block_number` 每 10 万块一级分区，`decoded_event` 同步分区并加 `block_number` 列；主键改为含分区键。见 `docs/PARTITIONING.md` | 未实施（触发条件：单表 50 GB 或 5000 万行，约 2.5 个月全量索引后）。迁移脚本已备：`scripts/partition/0001_partition_tables.sql` |
 | P4 | `offset` 兼容路径 | 保留可用但深翻页退化 | 已有 `cursor`，后续可考虑移除 `offset` 或加告警 |
 
 ### 7.3 验证与测试缺口
@@ -247,7 +247,7 @@ tasklist | grep -i indexer      # 有输出就先别启动
 | # | 事项 | 现状 |
 |---|---|---|
 | O1 | 索引器非常驻 | 手动 `go run`。停机超过约 1.4 天就滑出 publicnode 窗口，必须走一次补缺口流程（§9「缺口补齐」） |
-| O2 | 补缺口靠手工 | drpc + `BATCH_BLOCK_RANGE=100` + `RPC_HEADER_BATCH=3`，约 40 分钟，可脚本化 |
+| O2 | ~~补缺口靠手工~~ | ✅ 已脚本化：`scripts/fill-gap.sh`。自动判断是否滑出窗口（用免费端点实探，不写死 10,000）、需要时用 drpc 100 块/批补到窗口内并留余量，`--serve` 直接切回。前置检查拒绝重复实例 |
 | O3 | ~~无 CI~~ | ✅ 已加 `.github/workflows/ci.yml`（gofumpt / build / vet / test + npm ci / lint / build，不连库） |
 | O4 | ~~`Makefile` 跑不了~~ | ✅ 已加 `scripts/check.sh`，与 CI 同一套门禁；Makefile 保留给装了 make 的环境 |
 | O5 | ~~无 `.gitattributes`~~ | ✅ 已加，统一 LF |
@@ -529,6 +529,31 @@ MODE=local bash scripts/reorg-test/run.sh
 
 ---
 
+### 第五批：分区方案与补缺口脚本（✅ 完成 2026-11-23）
+
+**P3 分区方案**（`docs/PARTITIONING.md`）
+- 结论：`block_number` 一级 RANGE 分区，每 10 万块一个；全量 204 个分区、单分区约 940 万行 / 3.6 GB。
+- **主键必须改成 `(block_number, tx_hash, log_index)`**——PostgreSQL 要求唯一约束包含分区键，
+  这会连带改两处 `ON CONFLICT`，必须与 schema 同窗口发布。
+- `decoded_event` 同步分区并加 `block_number`：`DeleteFrom` 从子查询变成 `DELETE WHERE block_number >= $1`。
+- 代价写在文档里：画像查询没有块范围，**不会裁剪**，会 append 全部 204 个分区的 topic 索引。
+- 触发条件：单表 50 GB 或 5000 万行（按当前 91.6 行/块约 2.5 个月）。迁移脚本已备但不自动执行。
+
+**O2 补缺口脚本**（`scripts/fill-gap.sh`）
+- 不写死「窗口 10,000 块」：直接拿免费端点探测 `next_block`，被拒才补。窗口是滚动的，写死迟早失效。
+- 需要补时用 drpc + `BATCH_BLOCK_RANGE=100` + `RPC_HEADER_BATCH=3`，命中后继续补 `SAFETY`（默认 500）块余量。
+- 前置检查：已有 `indexer.exe` 就拒绝运行——两个实例会抢游标。
+- 已验证：语法、前置检查、`--dry-run`、「无需补缺口」分支。
+  **主循环（真正补缺口那段）未在受控环境端到端跑过**——它需要「停机 >1.4 天」这个真实条件；
+  本次 11-23 手工执行时用的参数与脚本一致（drpc + 100/3，1 小时 52 分补了 14,800 块）。
+
+**本次真实补缺口记录**（供下次估算）
+- 11-21 15:15 停 → 11-23 10:55 起，落后 17,912 块；publicnode 明确拒绝归档。
+- drpc：100 块/批约 40 秒 → 2.5 块/秒，补 14,800 块用了 1 小时 52 分。
+- 补过窗口后又用 publicnode 接手（19 块/秒），剩 3,700 块约 3 分钟追平。
+
+---
+
 ## 10. 常用命令
 
 ```bash
@@ -570,6 +595,11 @@ go run ./cmd/verify -from 26432530 -to 26433029 -batch 500
 
 # 第三方抽样对拍（Etherscan V2；需 ETHERSCAN_API_KEY，代理端口要现测）
 go run ./cmd/verify -source etherscan -segments 24 -width 5 -proxy http://127.0.0.1:10808
+
+# 停机过久后先判断是否需要补缺口（只判断，不改任何东西）
+bash scripts/fill-gap.sh --dry-run
+# 需要时补到窗口内，补完直接切回 publicnode 前台运行
+bash scripts/fill-gap.sh --serve
 
 # store 写路径集成测试（独立库；测试自建临时 schema）
 CHAINLENS_TEST_DSN='postgres://chainlens:chainlens_dev@localhost:5432/chainlens_test?sslmode=disable' \

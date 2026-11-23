@@ -170,6 +170,8 @@ PostgreSQL 的 `COPY` 协议不支持 `ON CONFLICT`，而 §8.4 同时要求「C
 | 文件 | 职责 | 阶段 |
 |---|---|---|
 | `Makefile` | `build` / `vet` / `fmt` / `fmt-check` / `migrate` / `db-reset` / `probe`。**本机没有 make，实际入口是 `scripts/check.sh`**；Makefile 保留给装了 make 的环境。 | W1D1 |
+| `scripts/fill-gap.sh` | 补缺口。先用免费端点探测 `next_block` 是否还能服务，需要时用归档端点（drpc）+ 100 块/批补到窗口内，再留 `SAFETY` 块余量。**前置检查会拒绝已有索引器在跑的情况**——两个实例会抢游标。`--dry-run` 只判断，`--serve` 补完直接切回免费端点。 | 交接后（2026-11-23） |
+| `scripts/partition/0001_partition_tables.sql` | 分区改造的维护脚本：建父表与分区、搬数据、校验数量、改名切换（含索引改名顺序）。**故意不放进 `migrations/`**——它要求停机与代码同窗口发布，不是可重复迁移。方案见 `docs/PARTITIONING.md`。 | 交接后（2026-11-23） |
 | `scripts/check.sh` | 本地质量门禁：`build` / `vet` / `test` / `gofumpt` + 前端 `lint` / `build`。与 CI 保持一致，避免「本地绿、CI 红」。`SKIP_WEB=1` 可只查 Go。 | 交接后（2026-11-20） |
 | `.gitattributes` | 统一 LF（`* text=auto eol=lf`），二进制文件不做转换。消除 Windows 上持续的 CRLF 警告，也防止 shell 脚本被 CRLF 破坏。 | 交接后（2026-11-20） |
 | `.github/workflows/ci.yml` | GitHub Actions，三个 job：`go`（gofumpt / build / vet / test；另起 postgres service 单独跑 `internal/store` 写路径测试）、`reorg`（安装 Foundry，`MODE=local` 跑 reorg 端到端回归）、`web`（npm ci / lint / build）。`internal/profile` 的集成测试仍不在 CI——它需要在有真实链上数据的库上采样。 | 交接后（2026-11-20、11-21） |
@@ -196,6 +198,7 @@ PostgreSQL 的 `COPY` 协议不支持 `ON CONFLICT`，而 §8.4 同时要求「C
 | `HANDOFF.md` | 项目设计与决策的唯一依据（定位、边界、ADR、数据模型、里程碑、规范）。**不随意改动**。 | 项目起始 |
 | `docs/FILES.md` | 本文件。 | W1D3 |
 | `docs/BENCHMARK.md` | W1 压测记录：`eth_getLogs` 容量、归档限制、批量对吞吐的影响、内存与存储占用、幂等结论、全量索引时间估算。W4 写 README 时从这里取数。 | W1 收尾 |
+| `docs/PARTITIONING.md` | 分区与归档方案（P3）：量级外推、分区键与粒度、主键必须含分区键、哪些查询能裁剪、迁移与回滚步骤、归档规则、实施触发条件。 | 交接后（2026-11-23） |
 | `docs/SESSION-HANDOFF.md` | **新会话的第一个入口**。记录当前进度、本机环境与口令位置、数据快照、已踩过的坑、待决策清单、遗留问题、常用命令、协作约定。与 `HANDOFF.md` 的分工：那份是设计依据（几乎不变），这份是运行状态（随时更新）。 | W3D1 结束 |
 
 ---
