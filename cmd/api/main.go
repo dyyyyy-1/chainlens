@@ -98,6 +98,7 @@ func run() error {
 		APITokens:          cfg.APITokens,
 		Tokens:             tokens,
 		Metas:              st,
+		Streamer:           st,
 		WebDir:             cfg.WebDir,
 	})
 

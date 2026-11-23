@@ -144,16 +144,7 @@ func (d Deps) handleEvents(w http.ResponseWriter, r *http.Request) {
 
 	items := make([]eventDTO, 0, len(events))
 	for _, event := range events {
-		items = append(items, eventDTO{
-			BlockNumber: event.BlockNumber,
-			BlockTime:   formatTime(event.BlockTime),
-			TxHash:      hexBytes(event.TxHash.Bytes()),
-			LogIndex:    event.LogIndex,
-			Contract:    hexAddress(event.Contract),
-			Event:       event.EventName,
-			Status:      event.Status,
-			Payload:     json.RawMessage(event.Payload),
-		})
+		items = append(items, toEventDTO(event))
 	}
 
 	coverage, err := d.Events.Coverage(r.Context())
@@ -170,6 +161,20 @@ func (d Deps) handleEvents(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, body)
+}
+
+// toEventDTO 把库内事件转成响应结构；分页与导出共用，避免两处字段不一致。
+func toEventDTO(event store.Event) eventDTO {
+	return eventDTO{
+		BlockNumber: event.BlockNumber,
+		BlockTime:   formatTime(event.BlockTime),
+		TxHash:      hexBytes(event.TxHash.Bytes()),
+		LogIndex:    event.LogIndex,
+		Contract:    hexAddress(event.Contract),
+		Event:       event.EventName,
+		Status:      event.Status,
+		Payload:     json.RawMessage(event.Payload),
+	}
 }
 
 func (d Deps) handleBalances(w http.ResponseWriter, r *http.Request) {

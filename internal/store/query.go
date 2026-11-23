@@ -87,6 +87,100 @@ LEFT JOIN decoded_event d ON d.tx_hash = l.tx_hash AND d.log_index = l.log_index
 // 一旦指定 from/to，就会先按 block_number 位图定位再排序。OFFSET 深翻页会退化，
 // 这是已知取舍（游标分页留到需要时再做）。
 func (s *Store) ListEvents(ctx context.Context, q EventQuery) ([]Event, error) {
+	query, args := buildEventQuery(q)
+
+	rows, err := s.pool.Query(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("store: list events: %w", err)
+	}
+	defer rows.Close()
+
+	events := make([]Event, 0, q.Limit)
+	for rows.Next() {
+		event, err := scanEvent(rows)
+		if err != nil {
+			return nil, err
+		}
+		events = append(events, event)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: list events: %w", err)
+	}
+
+	return events, nil
+}
+
+// StreamEvents 逐行读取事件并交给 fn，不在内存里攒整批结果。
+//
+// 导出用：200k 行 CSV 约 40 MB，先攒进切片再写响应会让进程内存随导出行数上升。
+// 回调返回错误即停止读取（例如客户端断开）。
+func (s *Store) StreamEvents(ctx context.Context, q EventQuery, fn func(Event) error) error {
+	query, args := buildEventQuery(q)
+
+	rows, err := s.pool.Query(ctx, query, args...)
+	if err != nil {
+		return fmt.Errorf("store: stream events: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		event, err := scanEvent(rows)
+		if err != nil {
+			return err
+		}
+		if err := fn(event); err != nil {
+			return err
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("store: stream events: %w", err)
+	}
+	return nil
+}
+
+// CountEvents 返回符合过滤条件的行数。
+//
+// 导出前先数一遍，是为了在写响应头之前就能拒绝「范围过大」——
+// 一旦开始流式输出，就没法再改状态码，只能给用户一个不完整的文件。
+func (s *Store) CountEvents(ctx context.Context, q EventQuery) (int64, error) {
+	conditions, args := buildEventConditions(q)
+
+	query := "SELECT count(*) FROM chain_log l"
+	if len(conditions) > 0 {
+		query += " WHERE " + strings.Join(conditions, " AND ")
+	}
+
+	var count int64
+	if err := s.pool.QueryRow(ctx, query, args...).Scan(&count); err != nil {
+		return 0, fmt.Errorf("store: count events: %w", err)
+	}
+	return count, nil
+}
+
+// buildEventQuery 把过滤条件拼成完整 SQL，供分页与导出共用。
+//
+// 共用同一个构造函数，是为了让导出与页面看到完全相同的数据与排序：
+// 两处各写一份条件，迟早会出现「页面少一条、导出多一条」这种难以解释的差异。
+func buildEventQuery(q EventQuery) (string, []any) {
+	conditions, args := buildEventConditions(q)
+
+	query := listEventsBase
+	if len(conditions) > 0 {
+		query += " WHERE " + strings.Join(conditions, " AND ")
+	}
+
+	order := " ORDER BY l.block_number DESC, l.log_index DESC"
+	if q.Cursor != nil {
+		args = append(args, q.Limit)
+		return query + order + fmt.Sprintf(" LIMIT $%d", len(args)), args
+	}
+
+	args = append(args, q.Limit, q.Offset)
+	return query + order + fmt.Sprintf(" LIMIT $%d OFFSET $%d", len(args)-1, len(args)), args
+}
+
+// buildEventConditions 按需拼接 WHERE 条件与参数。
+func buildEventConditions(q EventQuery) ([]string, []any) {
 	conditions := make([]string, 0, 3)
 	args := make([]any, 0, 5)
 
@@ -109,48 +203,25 @@ func (s *Store) ListEvents(ctx context.Context, q EventQuery) ([]Event, error) {
 		conditions = append(conditions, fmt.Sprintf("(l.block_number, l.log_index) < ($%d, $%d)", len(args)-1, len(args)))
 	}
 
-	query := listEventsBase
-	if len(conditions) > 0 {
-		query += " WHERE " + strings.Join(conditions, " AND ")
-	}
+	return conditions, args
+}
 
-	order := " ORDER BY l.block_number DESC, l.log_index DESC"
-	if q.Cursor != nil {
-		args = append(args, q.Limit)
-		query += order + fmt.Sprintf(" LIMIT $%d", len(args))
-	} else {
-		args = append(args, q.Limit, q.Offset)
-		query += order + fmt.Sprintf(" LIMIT $%d OFFSET $%d", len(args)-1, len(args))
+// scanEvent 读取一行事件。列顺序与 listEventsBase 绑定，两处必须同步改。
+func scanEvent(rows pgx.Rows) (Event, error) {
+	var (
+		event   Event
+		txHash  []byte
+		payload []byte
+	)
+	if err := rows.Scan(
+		&event.BlockNumber, &event.BlockTime, &txHash, &event.LogIndex, &event.Contract,
+		&event.EventName, &event.Status, &payload,
+	); err != nil {
+		return Event{}, fmt.Errorf("store: scan event: %w", err)
 	}
-
-	rows, err := s.pool.Query(ctx, query, args...)
-	if err != nil {
-		return nil, fmt.Errorf("store: list events: %w", err)
-	}
-	defer rows.Close()
-
-	events := make([]Event, 0, q.Limit)
-	for rows.Next() {
-		var (
-			event   Event
-			txHash  []byte
-			payload []byte
-		)
-		if err := rows.Scan(
-			&event.BlockNumber, &event.BlockTime, &txHash, &event.LogIndex, &event.Contract,
-			&event.EventName, &event.Status, &payload,
-		); err != nil {
-			return nil, fmt.Errorf("store: scan event: %w", err)
-		}
-		event.TxHash = common.BytesToHash(txHash)
-		event.Payload = payload
-		events = append(events, event)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("store: list events: %w", err)
-	}
-
-	return events, nil
+	event.TxHash = common.BytesToHash(txHash)
+	event.Payload = payload
+	return event, nil
 }
 
 // coverageSQL 一次取回水位与区间边界。

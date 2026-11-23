@@ -60,6 +60,8 @@ type Deps struct {
 	Tokens TokenReader
 	// Metas 非空时 /balances 为每个合约带上 decimals；为空时该字段为 null。
 	Metas TokenMetaReader
+	// Streamer 提供导出的流式读取；为空时 /api/events/export 返回 500。
+	Streamer EventStreamer
 	// WebDir 非空时在该目录托管前端构建产物（web/dist），并做 SPA 回退。
 	WebDir string
 
@@ -80,6 +82,7 @@ func NewRouter(d Deps) http.Handler {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/events", d.handleEvents)
+	mux.HandleFunc("GET /api/events/export", d.handleExport)
 	mux.HandleFunc("GET /api/address/{addr}/balances", d.handleBalances)
 	mux.HandleFunc("GET /api/address/{addr}/approvals", d.handleApprovals)
 	mux.HandleFunc("GET /api/address/{addr}/interactions", d.handleInteractions)
