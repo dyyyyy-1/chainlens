@@ -4,10 +4,9 @@ import { setAuthToken } from './api'
 import { AddressProfile } from './components/AddressProfile'
 import { EventExplorer } from './components/EventExplorer'
 import { StatsPanel } from './components/StatsPanel'
+import { readAppState, writeAppState, type AppState, type TabId } from './urlState'
 
 const TOKEN_STORAGE_KEY = 'chainlens.apiToken'
-
-type TabId = 'stats' | 'address' | 'events'
 
 const TABS: { id: TabId; label: string }[] = [
   { id: 'stats', label: '索引统计' },
@@ -16,7 +15,8 @@ const TABS: { id: TabId; label: string }[] = [
 ]
 
 export default function App() {
-  const [tab, setTab] = useState<TabId>('stats')
+  const [state, setState] = useState<AppState>(() => readAppState())
+  const tab: TabId = state.tab
   const [token, setToken] = useState<string>(() => {
     try {
       return localStorage.getItem(TOKEN_STORAGE_KEY) ?? ''
@@ -25,6 +25,24 @@ export default function App() {
       return ''
     }
   })
+
+  // 状态变化后同步到 URL；replaceState 幂等，重复调用不会累积历史。
+  useEffect(() => {
+    writeAppState(state)
+  }, [state])
+
+  // 浏览器前进/后退时从 URL 还原，保证地址栏与界面一致。
+  useEffect(() => {
+    function handlePopState() {
+      setState(readAppState())
+    }
+    window.addEventListener('popstate', handlePopState)
+    return () => window.removeEventListener('popstate', handlePopState)
+  }, [])
+
+  function update(patch: Partial<AppState>) {
+    setState((previous) => ({ ...previous, ...patch }))
+  }
 
   useEffect(() => {
     setAuthToken(token)
@@ -50,7 +68,7 @@ export default function App() {
               key={item.id}
               className="tab"
               data-active={tab === item.id}
-              onClick={() => setTab(item.id)}
+              onClick={() => update({ tab: item.id })}
             >
               {item.label}
             </button>
@@ -73,8 +91,20 @@ export default function App() {
         {/* 用 token 做 key：改 token 时重新挂载，自动按新凭据重取数据。 */}
         <div key={token}>
           {tab === 'stats' ? <StatsPanel /> : null}
-          {tab === 'address' ? <AddressProfile initialAddress="" /> : null}
-          {tab === 'events' ? <EventExplorer /> : null}
+          {tab === 'address' ? (
+            <AddressProfile
+              initialAddress={state.address}
+              onAddressChange={(address) => update({ address })}
+            />
+          ) : null}
+          {tab === 'events' ? (
+            <EventExplorer
+              initialFilters={{ contract: state.contract, from: state.from, to: state.to }}
+              onFiltersChange={(filters) =>
+                update({ contract: filters.contract, from: filters.from, to: filters.to })
+              }
+            />
+          ) : null}
         </div>
 
         <div className="footer">

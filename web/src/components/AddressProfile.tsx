@@ -1,4 +1,4 @@
-import { useState, type FormEvent } from 'react'
+import { useEffect, useState, type FormEvent } from 'react'
 
 import {
   ApiError,
@@ -24,17 +24,22 @@ interface ProfileState {
   onchain: Onchain
 }
 
-export function AddressProfile({ initialAddress }: { initialAddress: string }) {
+export function AddressProfile({
+  initialAddress,
+  onAddressChange,
+}: {
+  initialAddress: string
+  onAddressChange?: (address: string) => void
+}) {
   const [address, setAddress] = useState(initialAddress)
   const [state, setState] = useState<ProfileState | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [isLoading, setIsLoading] = useState(false)
 
-  async function handleSubmit(event: FormEvent) {
-    event.preventDefault()
+  async function runQuery(raw: string) {
     setError(null)
 
-    const trimmed = address.trim()
+    const trimmed = raw.trim()
     if (!isAddress(trimmed)) {
       setError('地址格式不对：需要 0x 开头的 40 位十六进制')
       return
@@ -48,6 +53,8 @@ export function AddressProfile({ initialAddress }: { initialAddress: string }) {
         fetchApprovals(trimmed),
         fetchInteractions(trimmed),
       ])
+      // 查询成功后才写 URL：把输入框里的半截地址同步到地址栏没有意义。
+      onAddressChange?.(trimmed)
       setState({
         coverage: balances.coverage,
         holdings: balances.data,
@@ -63,6 +70,21 @@ export function AddressProfile({ initialAddress }: { initialAddress: string }) {
       setIsLoading(false)
     }
   }
+
+  function handleSubmit(event: FormEvent) {
+    event.preventDefault()
+    void runQuery(address)
+  }
+
+  // 带 address 的深链应直接出结果：分享出去的链接点开就能看到画像，
+  // 而不是先看到一张空表单、还得再点一次查询。
+  useEffect(() => {
+    if (initialAddress) {
+      void runQuery(initialAddress)
+    }
+    // 只在挂载时按 URL 里的地址查一次；后续由表单驱动。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
   return (
     <div className="stack">

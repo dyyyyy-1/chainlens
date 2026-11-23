@@ -185,3 +185,55 @@ export function fetchEvents(query: EventQuery): Promise<EventsEnvelope> {
 export function isAddress(value: string): boolean {
   return /^0x[0-9a-fA-F]{40}$/.test(value.trim())
 }
+
+/**
+ * fetchExport 下载导出文件。
+ *
+ * 走 fetch 而不是 `<a href>`：导出接口同样受 Bearer 鉴权保护，
+ * 直接给链接的话浏览器不会带 Authorization 头，下载会 401。
+ */
+export async function fetchExport(
+  query: Pick<EventQuery, 'contract' | 'from' | 'to'>,
+  format: 'csv' | 'json',
+): Promise<{ blob: Blob; filename: string }> {
+  const params = new URLSearchParams({ format })
+  if (query.contract) params.set('contract', query.contract)
+  if (query.from) params.set('from', query.from)
+  if (query.to) params.set('to', query.to)
+
+  const headers: Record<string, string> = {}
+  if (authToken) {
+    headers.Authorization = `Bearer ${authToken}`
+  }
+
+  let response: Response
+  try {
+    response = await fetch(`/api/events/export?${params.toString()}`, { headers })
+  } catch {
+    throw new ApiError(0, 'network_error', '无法连接查询服务，确认 cmd/api 是否在运行')
+  }
+
+  if (!response.ok) {
+    const text = await response.text()
+    let code = 'unknown'
+    let message = `HTTP ${response.status}`
+    if (text) {
+      try {
+        const failure = JSON.parse(text) as { error?: { code?: string; message?: string } }
+        code = failure.error?.code ?? code
+        message = failure.error?.message ?? message
+      } catch {
+        // 非 JSON 错误体（例如代理返回的 HTML）保留默认文案。
+      }
+    }
+    throw new ApiError(response.status, code, message)
+  }
+
+  const disposition = response.headers.get('Content-Disposition') ?? ''
+  const matched = /filename="([^"]+)"/.exec(disposition)
+
+  return {
+    blob: await response.blob(),
+    filename: matched?.[1] ?? `chainlens-events.${format}`,
+  }
+}

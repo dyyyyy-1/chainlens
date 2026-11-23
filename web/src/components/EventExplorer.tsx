@@ -3,6 +3,7 @@ import { useCallback, useEffect, useState, type FormEvent } from 'react'
 import {
   ApiError,
   fetchEvents,
+  fetchExport,
   isAddress,
   type Coverage,
   type EventItem,
@@ -46,13 +47,19 @@ function payloadSummary(item: EventItem): string {
   return json.length > 90 ? `${json.slice(0, 90)}…` : json
 }
 
-export function EventExplorer() {
+interface EventExplorerProps {
+  initialFilters?: Partial<Filters>
+  onFiltersChange?: (filters: Filters) => void
+}
+
+export function EventExplorer({ initialFilters, onFiltersChange }: EventExplorerProps) {
   const [filters, setFilters] = useState<Filters>({
-    contract: '',
-    from: '',
-    to: '',
+    contract: initialFilters?.contract ?? '',
+    from: initialFilters?.from ?? '',
+    to: initialFilters?.to ?? '',
     limit: DEFAULT_LIMIT,
   })
+  const [isExporting, setIsExporting] = useState(false)
   const [items, setItems] = useState<EventItem[]>([])
   const [coverage, setCoverage] = useState<Coverage | null>(null)
   const [cursor, setCursor] = useState<string>('')
@@ -110,7 +117,44 @@ export function EventExplorer() {
   function handleSubmit(event: FormEvent) {
     event.preventDefault()
     setIsLoading(true)
+    // 只把过滤条件写进 URL：翻页游标是「读到哪了」，不是可分享的状态。
+    onFiltersChange?.(filters)
     void load('')
+  }
+
+  async function handleExport(format: 'csv' | 'json') {
+    setError(null)
+    setIsExporting(true)
+    try {
+      const contract = filters.contract.trim()
+      if (contract && !isAddress(contract)) {
+        setError('合约地址格式不对：需要 0x 开头的 40 位十六进制')
+        return
+      }
+
+      // 导出覆盖整个过滤范围，与页面上的分页无关。
+      const { blob, filename } = await fetchExport(
+        {
+          contract: contract || undefined,
+          from: filters.from.trim() || undefined,
+          to: filters.to.trim() || undefined,
+        },
+        format,
+      )
+
+      const url = URL.createObjectURL(blob)
+      const link = document.createElement('a')
+      link.href = url
+      link.download = filename
+      document.body.appendChild(link)
+      link.click()
+      link.remove()
+      URL.revokeObjectURL(url)
+    } catch (failure) {
+      setError(failure instanceof ApiError ? failure.message : String(failure))
+    } finally {
+      setIsExporting(false)
+    }
   }
 
   return (
@@ -174,7 +218,25 @@ export function EventExplorer() {
       <div className="panel">
         <div className="panel-head">
           <span className="panel-title">结果</span>
-          <span className="panel-hint">已加载 {groupNumber(items.length)} 条</span>
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+            <span className="panel-hint">已加载 {groupNumber(items.length)} 条</span>
+            <button
+              className="btn"
+              type="button"
+              onClick={() => void handleExport('csv')}
+              disabled={isExporting}
+            >
+              {isExporting ? '导出中…' : '导出 CSV'}
+            </button>
+            <button
+              className="btn"
+              type="button"
+              onClick={() => void handleExport('json')}
+              disabled={isExporting}
+            >
+              导出 JSON
+            </button>
+          </div>
         </div>
 
         {items.length === 0 ? (
@@ -233,7 +295,8 @@ export function EventExplorer() {
 
         <div className="note">
           事件参数里的金额同样按 6 位小数展示。翻页用键集游标：从上一页最后一行继续，
-          不会因为并发写入而跳行。
+          不会因为并发写入而跳行。导出覆盖<strong>当前过滤条件下的全部事件</strong>（上限 20 万行），
+          与页面上的分页无关；超出上限会提示缩小区块范围。
         </div>
       </div>
     </div>
